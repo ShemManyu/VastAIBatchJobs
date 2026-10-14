@@ -125,6 +125,8 @@ Credential values and URL query strings are redacted from collected diagnostics.
 
 This is a synchronous, one-prompt workflow, not training, an agent/tool runner, an interactive session, or a persistent endpoint. Use a standalone text GGUF supported by the pinned runtime. Split GGUFs, multimodal sidecars, and adapters are unsupported; common filename patterns are rejected before rental. Differently named unsupported architectures or files fail explicitly during remote loading. CPU fallback and partial GPU-layer offload are not accepted as successful GPU execution.
 
+The worker sets server verbosity to `4`: the pinned runtime hides its model-loader and GPU-offload diagnostics at the default level `3`. After healthy startup, it waits briefly for the asynchronous logger to report nonzero full layer offload from this server, not an earlier log entry. Missing, zero, or partial offload still fails before generation and triggers teardown.
+
 Runtime source is pinned to llama.cpp **v0.6.0**, commit `8345f333951c661d166b00e6f9362e553768f292`. Each fresh instance builds `llama-server` for its GPU, so setup time is part of the paid run.
 
 ## Local verification
@@ -137,4 +139,6 @@ python run_job.py --help
 
 Tests use fake cloud/SSH/downloader interfaces, temporary directories, fake clocks, and a local HTTP fixture. They never read your actual `.env`, rent a GPU, download real weights, or require CUDA. They cover teardown, uncertain allocation, cancellation, recovery isolation, artifact integrity, credential redaction, full GPU-offload evidence, and price/VRAM boundaries.
 
-Live read-only template, model metadata, offer pagination, and CLI dry-run checks have been exercised. **No paid GPU smoke test has been performed**; mocked tests are not proof that remote SSH, CUDA compilation, and real model inference work together on a particular host. A paid smoke test requires separate approval.
+Live read-only template, model metadata, offer pagination, and CLI dry-run checks have been exercised. A paid A100 run reached remote SSH, CUDA compilation, verified model download, and healthy server startup, but stopped before generation because default logging hid the required GPU-offload evidence. Teardown was confirmed. That logging mismatch is covered by a local regression.
+
+**Successful real GPU generation and retrieval have not yet been confirmed.** Local tests are not proof of a successful end-to-end GPU run, and another paid smoke test requires separate approval.

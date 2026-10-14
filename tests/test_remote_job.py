@@ -8,9 +8,12 @@ import threading
 import unittest
 from unittest.mock import MagicMock, patch
 
-from job_utils import Deadline, JobError, LLAMA_COMMIT
+from job_utils import Deadline, DeadlineExceeded, JobError, LLAMA_COMMIT
 import remote_job
-from remote_job import bootstrap, download_model, gpu_details, infer, server_args, wait_for_server
+from remote_job import (
+    bootstrap, download_model, gpu_details, infer, server_args,
+    wait_for_gpu_offload, wait_for_server,
+)
 from tests.fakes import ANSWER, Clock, HF_TOKEN, VAST_TOKEN
 
 
@@ -140,6 +143,7 @@ class WorkerTests(WorkerFixture):
         self.assertEqual(args[args.index("--ctx-size") + 1], "4096")
         self.assertIn("--no-context-shift", args)
         self.assertIn("--offline", args)
+        self.assertEqual(args[args.index("--verbosity") + 1], "4")
 
     def test_server_readiness_waits_for_loading_but_rejects_failed_or_missing_health(self):
         process = MagicMock()
@@ -161,6 +165,57 @@ class WorkerTests(WorkerFixture):
         process.poll.return_value = 1
         with self.assertRaises(JobError):
             wait_for_server(process, "http://127.0.0.1:1234", Deadline(10), http)
+
+    def test_offload_verification_waits_for_async_logs_from_only_the_current_server(self):
+        path = self.root / "remote.log"
+        path.write_text("old server: offloaded 33/33 layers to GPU\n")
+        offset = path.stat().st_size
+        process = MagicMock()
+        process.poll.return_value = None
+        clock = Clock()
+        deadline = clock.deadline(10)
+        flushed = False
+
+        def flush_later(seconds):
+            nonlocal flushed
+            clock.sleep(seconds)
+            if clock.value >= 0.2 and not flushed:
+                with path.open("ab") as file:
+                    file.write(b"0.01.897.000 I load_tensors: offloaded 33/33 layers to GPU\n")
+                flushed = True
+
+        deadline.sleeper = flush_later
+        wait_for_gpu_offload(process, path, offset, deadline)
+        self.assertTrue(flushed)
+        self.assertEqual(clock.value, 0.2)
+
+    def test_missing_zero_or_partial_offload_never_passes_gpu_verification(self):
+        path = self.root / "remote.log"
+        process = MagicMock()
+        process.poll.return_value = None
+        for message in (
+            "model loaded\n", "offloaded 0/33 layers to GPU\n",
+            "offloaded 16/33 layers to GPU\n", "offloaded 0/0 layers to GPU\n",
+        ):
+            with self.subTest(message=message):
+                path.write_text(message)
+                clock = Clock()
+                with self.assertRaises(JobError):
+                    wait_for_gpu_offload(process, path, 0, clock.deadline(10))
+                self.assertEqual(clock.value, 5 if message == "model loaded\n" else 0)
+
+    def test_offload_wait_is_bounded_by_job_deadline_and_server_liveness(self):
+        path = self.root / "remote.log"
+        path.write_text("")
+        process = MagicMock()
+        process.poll.return_value = None
+        clock = Clock()
+        with self.assertRaises(DeadlineExceeded):
+            wait_for_gpu_offload(process, path, 0, clock.deadline(0.2))
+        self.assertEqual(clock.value, 0.2)
+        process.poll.return_value = 1
+        with self.assertRaises(JobError):
+            wait_for_gpu_offload(process, path, 0, Deadline(10))
 
 
 class LocalHttpInferenceTests(WorkerFixture):
@@ -185,7 +240,18 @@ class LocalHttpInferenceTests(WorkerFixture):
     def spawn(self, args, **kwargs):
         self.spawn_arguments = args
         self.spawn_environment = kwargs["env"]
-        kwargs["stdout"].write(f"load_tensors: offloaded {self.layers} layers to GPU\n".encode())
+        verbosity = int(args[args.index("--verbosity") + 1]) if "--verbosity" in args else 3
+        diagnostics = [
+            f"0.00.115.121 I cmn common_param: verbosity = {verbosity}",
+            "0.00.121.871 I srv load_model: loading model '/fixture/model.gguf'",
+        ]
+        if verbosity >= 4:
+            diagnostics.append(f"0.01.897.000 I load_tensors: offloaded {self.layers} layers to GPU")
+        diagnostics.extend([
+            "0.01.962.488 I srv llama_server: model loaded",
+            "0.01.962.495 I srv llama_server: listening on http://127.0.0.1",
+        ])
+        kwargs["stdout"].write(("\n".join(diagnostics) + "\n").encode())
         kwargs["stdout"].flush()
         owner = self
 
@@ -241,7 +307,7 @@ class LocalHttpInferenceTests(WorkerFixture):
                  "HTTP_PROXY": "http://invalid-proxy.invalid:3128", "NO_PROXY": "",
              }):
             try:
-                return infer(self.root, request, Deadline(30))
+                return infer(self.root, request, Clock().deadline(30))
             finally:
                 stop.assert_called_once()
                 self.assertTrue(all(not thread.is_alive() for thread in self.threads))
@@ -261,6 +327,13 @@ class LocalHttpInferenceTests(WorkerFixture):
         self.assertNotIn("HF_TOKEN", self.spawn_environment)
         self.assertNotIn("VAST_AI_API_KEY", self.spawn_environment)
         self.assertNotIn(HF_TOKEN, " ".join(self.spawn_arguments))
+
+    def test_pinned_runtime_trace_logging_confirms_gpu_before_generating(self):
+        result = self.execute_inference()
+        self.assertEqual(result["status"], "completed")
+        self.assertIn("offloaded 33/33 layers to GPU", (self.root / "remote.log").read_text())
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual((self.root / "response.txt").read_text(), ANSWER)
 
     def test_cpu_or_partial_offload_cannot_pass_as_gpu_execution(self):
         for layers in ("0/33", "16/33", ""):

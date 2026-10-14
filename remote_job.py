@@ -209,12 +209,39 @@ def wait_for_server(
 
 
 def server_args(binary: Path, model: Path, context_size: int, port: int) -> list[str]:
+    # The pinned runtime maps loader INFO messages to trace verbosity.
     return [
         str(binary), "--model", str(model), "--host", "127.0.0.1", "--port", str(port),
         "--ctx-size", str(context_size), "--parallel", "1", "--n-gpu-layers", "all",
         "--fit", "off", "--no-context-shift", "--alias", "batch-model",
-        "--offline", "--log-colors", "off",
+        "--offline", "--log-colors", "off", "--verbosity", "4",
     ]
+
+
+def wait_for_gpu_offload(
+    process: subprocess.Popen[bytes], path: Path, offset: int, deadline: Deadline,
+) -> None:
+    end = deadline.clock() + min(5, deadline.remaining())
+    diagnostics = ""
+    with path.open("rb") as diagnostics_file:
+        diagnostics_file.seek(offset)
+        while True:
+            if process.poll() is not None:
+                raise JobError("llama-server exited before GPU offload verification; see remote.log.")
+            diagnostics += diagnostics_file.read().decode("utf-8", errors="replace")
+            offload = re.search(r"offloaded (\d+)/(\d+) layers to GPU", diagnostics)
+            if offload is not None:
+                loaded, total = int(offload[1]), int(offload[2])
+                if loaded <= 0 or loaded != total:
+                    raise JobError(
+                        f"llama-server offloaded {loaded}/{total} layers; full GPU offload is required."
+                    )
+                return
+            remaining = end - deadline.clock()
+            if remaining <= 0:
+                raise JobError("llama-server did not report GPU layer-offload counts; see remote.log.")
+            # The runtime's asynchronous logger can lag behind its health response.
+            deadline.sleep(min(0.1, remaining))
 
 
 def infer(root: Path, request: dict[str, Any], deadline: Deadline) -> dict[str, Any]:
@@ -261,12 +288,7 @@ def infer(root: Path, request: dict[str, Any], deadline: Deadline) -> dict[str, 
         http.trust_env = False
         try:
             wait_for_server(process, url, deadline, http)
-            with (root / "remote.log").open("rb") as diagnostics_file:
-                diagnostics_file.seek(log_offset)
-                diagnostics = diagnostics_file.read().decode("utf-8", errors="replace")
-            offload = re.search(r"offloaded (\d+)/(\d+) layers to GPU", diagnostics)
-            if offload is None or int(offload[1]) <= 0 or int(offload[1]) != int(offload[2]):
-                raise JobError("llama-server did not confirm full GPU layer offload.")
+            wait_for_gpu_offload(process, root / "remote.log", log_offset, deadline)
             remaining = deadline.remaining()
             connect_timeout = min(5, remaining / 2)
             try:
