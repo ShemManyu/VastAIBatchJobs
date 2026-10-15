@@ -98,7 +98,9 @@ After those fixes, a **480B Q3_K_S continuation on four 80 GB A100s** completed 
 
 Direct review still rejected the report: it mislabeled Dai's legacy permit as EIP-2612 and mentioned a nonexistent WETH9 `push`. The renderer consumes the prose notes but ignores its extracted declaration/modifier arrays, and the report omits the requested wei presentation despite retaining exact wei in JSON. Original model artifacts and the completed controller status remain unchanged; a separate manual-review record distinguishes real execution success from report acceptance.
 
-All 24 registered allocations were independently confirmed absent. The four-A100 continuation's updated recorded charge was $2.608, bringing all five instances under the renewed authorization to $3.862 when checked, subject to updates. No source-grounded research result from this authorization has yet been accepted.
+A separate reviewer-authored `reviewed-report.md` beside the returned artifacts corrects the source claims, includes exact wei/ETH and covers all 11+6 named functions. Its source declarations, observed amounts and unchanged raw artifact hashes were checked. It is not model-authored output or evidence of autonomous report accuracy. No further rental was started for these corrections.
+
+All 24 registered allocations were independently confirmed absent. The four-A100 continuation's updated recorded charge was $2.608, bringing all five instances under the renewed authorization to $3.862 when checked, subject to updates. No raw model report from this authorization has yet passed complete source review.
 
 The research example uses a 49,152-token context and reserves 4,096 output tokens per decision. The pinned server caps usable slots to the GGUF's training context even if `--context-size` requests more; the worker checks `/props` after startup and fails before generation if the actual single-slot capacity is smaller. Increasing the allocation alone did not extend the tested Qwen2.5-Coder model's 32,768-token limit.
 
