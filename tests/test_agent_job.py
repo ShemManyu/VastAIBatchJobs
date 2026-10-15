@@ -11,10 +11,13 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
 
-from agent_job import ACTION_SCHEMA, Sandbox, bootstrap_tools, parse_action, run_agent, scrub_values
+from agent_job import (
+    ACTION_SCHEMA, HISTORY_MARKER, Sandbox, bootstrap_tools, compact_history,
+    history_observation, parse_action, run_agent, scrub_values,
+)
 from agent_tools import ToolError, execute
-from agent_utils import AgentOptions, MAX_VERIFICATION_BYTES
-from job_utils import Deadline, DeadlineExceeded, JobError
+from agent_utils import AgentOptions, MAX_VERIFICATION_BYTES, TOOL_OUTPUT_BYTES
+from job_utils import ContextLimitError, Deadline, DeadlineExceeded, JobError
 from remote_job import ModelRuntime, agent, model_runtime, server_args
 from tests.fakes import HF_TOKEN, Response, VAST_TOKEN
 
@@ -157,6 +160,100 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(first_observation["stdout"], "bad\n")
         transcript = json.loads((self.root / "agent-transcript.json").read_text())
         self.assertEqual(transcript["steps"][2]["observation"]["stdout"], "42\n")
+
+    def test_measured_context_overflow_compacts_then_recalls_the_original_observation(self):
+        self.runtime.context_size = 4800
+        payload = "detail " * 1700
+        report = self.run_actions([
+            {"action": "write_file", "path": "source.txt", "content": payload},
+            {"action": "read_file", "path": "source.txt"},
+            {"action": "read_history", "step": 2},
+            {"action": "finish", "summary": "The original source observation was recalled."},
+        ])
+        self.assertEqual(report["status"], "completed", report.get("error"))
+        self.assertEqual(report["steps"], 4)
+        self.assertGreater(report["context_compactions"], 0)
+        self.assertEqual([action["action"] for action in self.sandbox.actions], ["write_file", "read_file"])
+        self.assertEqual((self.sandbox.workspace / "source.txt").read_text(), payload)
+        transcript = json.loads((self.root / "agent-transcript.json").read_text())
+        original = transcript["steps"][1]
+        recalled = json.loads(transcript["steps"][2]["observation"]["content"])
+        self.assertEqual(recalled, original)
+        self.assertEqual(original["observation"]["content"], payload[:TOOL_OUTPUT_BYTES])
+        self.assertEqual(len(transcript["context_compactions"]), report["context_compactions"])
+        initial = self.model_requests[0]["messages"]
+        for request in self.model_requests:
+            messages = request["messages"]
+            self.assertEqual(messages[0], initial[0])
+            self.assertEqual(messages[1]["content"].split(HISTORY_MARKER)[0], initial[1]["content"])
+            self.assertLessEqual(
+                len(json.dumps(messages).split()) + self.runtime.max_tokens,
+                self.runtime.context_size,
+            )
+        self.assertIn(HISTORY_MARKER, self.model_requests[-1]["messages"][1]["content"])
+
+    def test_context_compaction_preserves_failed_verification_and_requires_a_real_fix(self):
+        self.runtime.context_size = 4800
+        payload = "detail " * 1700
+        code = (
+            "import json\nfrom pathlib import Path\n"
+            "if json.loads(Path('value.json').read_text())['value'] != 42:\n"
+            "    raise ValueError('actual value must be 42')\n"
+            "print('actual corrected value verified')\n"
+        )
+        report = self.run_actions([
+            {"action": "write_file", "path": "value.json", "content": '{"value":7}'},
+            {"action": "finish", "summary": "Incorrect output."},
+            {"action": "write_file", "path": "source.txt", "content": payload},
+            {"action": "read_file", "path": "source.txt"},
+            {"action": "write_file", "path": "value.json", "content": '{"value":42}'},
+            {"action": "finish", "summary": "The corrected output passed the actual verifier."},
+        ], options=AgentOptions(verification_code=code))
+        self.assertEqual(report["status"], "completed", report.get("error"))
+        self.assertGreater(report["context_compactions"], 0)
+        self.assertEqual(report["verification"]["stdout"], "actual corrected value verified\n")
+        compacted = self.model_requests[4]["messages"]
+        ledger = json.loads(compacted[1]["content"].split(HISTORY_MARKER)[1].split("\nDetails ")[0])
+        rejected = next(row for row in ledger if row["step"] == 2)
+        self.assertIn("Finish rejected", rejected["error"])
+        self.assertNotEqual(rejected["verification"]["exit_code"], 0)
+        self.assertIn("actual value must be 42", rejected["verification"]["stderr"])
+        latest = json.loads(compacted[-1]["content"].split("\n", 1)[1])
+        self.assertEqual(latest["content"], payload[:TOOL_OUTPUT_BYTES])
+        transcript = json.loads((self.root / "agent-transcript.json").read_text())
+        self.assertNotEqual(transcript["steps"][1]["observation"]["verification"]["exit_code"], 0)
+        self.assertEqual(json.loads((self.sandbox.workspace / "value.json").read_text()), {"value": 42})
+
+    def test_unfit_original_task_is_not_discarded_or_sent_to_generation(self):
+        self.runtime.context_size = 10
+        self.runtime.max_tokens = 2
+        report = self.run_actions([{"action": "finish", "summary": "must not run"}])
+        self.assertEqual(report["status"], "failed")
+        self.assertIn("ContextLimitError", report["error"])
+        self.assertEqual(report["context_compactions"], 0)
+        self.assertEqual(self.model_requests, [])
+        self.assertEqual(self.sandbox.actions, [])
+        self.assertFalse((self.root / "response.txt").exists())
+
+    def test_unfit_latest_observation_fails_without_dropping_it_or_reexecuting_tools(self):
+        self.runtime.context_size = 2000
+        self.runtime.max_tokens = 128
+        (self.sandbox.workspace / "large.txt").write_text("detail " * 5000)
+        report = self.run_actions([
+            {"action": "run", "argv": [sys.executable, "-c", "print('executed once')"]},
+            {"action": "read_file", "path": "large.txt"},
+            {"action": "finish", "summary": "must not run"},
+        ])
+        self.assertEqual(report["status"], "failed")
+        self.assertIn("ContextLimitError", report["error"])
+        self.assertEqual(report["steps"], 2)
+        self.assertEqual(report["context_compactions"], 1)
+        self.assertEqual(len(self.model_requests), 2)
+        self.assertEqual(len(self.sandbox.actions), 2)
+        transcript = json.loads((self.root / "agent-transcript.json").read_text())
+        self.assertEqual(transcript["steps"][0]["observation"]["stdout"], "executed once\n")
+        self.assertEqual(len(transcript["steps"][1]["observation"]["content"].encode()), TOOL_OUTPUT_BYTES)
+        self.assertFalse((self.root / "response.txt").exists())
 
     def test_finish_verifier_executes_the_snapshot_and_rejects_incorrect_output_until_fixed(self):
         code = (
@@ -339,8 +436,11 @@ class RuntimeAndIsolationTests(unittest.TestCase):
                     runtime.complete([{"role": "user", "content": "task"}], ACTION_SCHEMA, Deadline(10))
                     self.assertEqual(http.post.call_count, 3)
                 else:
-                    with self.assertRaises(JobError):
+                    with self.assertRaises(ContextLimitError) as raised:
                         runtime.complete([{"role": "user", "content": "task"}], ACTION_SCHEMA, Deadline(10))
+                    self.assertEqual(raised.exception.input_tokens, 3)
+                    self.assertEqual(raised.exception.output_tokens, 2)
+                    self.assertEqual(raised.exception.context_size, 4)
                     self.assertEqual(http.post.call_count, 2)
                 self.assertFalse(http.post.call_args.kwargs["allow_redirects"])
 
@@ -459,6 +559,75 @@ class RuntimeAndIsolationTests(unittest.TestCase):
         ):
             with self.subTest(action=action), self.assertRaises(JobError):
                 parse_action(decision(action))
+
+
+class HistoryTests(unittest.TestCase):
+    def record(self, action=None, observation=None):
+        action = action or {"action": "run", "argv": ["python3", "script.py"]}
+        return {
+            "step": 1, "action": action, "completion": decision(action),
+            "observation": observation or {
+                "exit_code": 7, "timed_out": False, "stdout": "original output",
+            },
+        }
+
+    def test_history_pages_are_exact_bounded_utf8_and_redacted_before_offsets(self):
+        record = self.record(observation={
+            "exit_code": 0, "timed_out": False, "stdout": "\u00e9" * 20000 + TASK_KEY,
+        })
+        pages = []
+        offset = 0
+        while True:
+            result = history_observation([record], {"step": 1, "offset": offset}, (TASK_KEY,))
+            self.assertNotIn("error", result)
+            self.assertLessEqual(result["bytes_read"], TOOL_OUTPUT_BYTES)
+            self.assertEqual(result["bytes_read"], len(result["content"].encode()))
+            self.assertEqual(result["offset"], offset)
+            pages.append(result["content"])
+            if not result["truncated"]:
+                break
+            self.assertGreater(result["next_offset"], offset)
+            offset = result["next_offset"]
+        data = "".join(pages)
+        self.assertGreater(len(pages), 1)
+        self.assertEqual(json.loads(data), scrub_values(record, (TASK_KEY,)))
+        self.assertNotIn(TASK_KEY, data)
+        self.assertEqual(result["total_bytes"], len(data.encode()))
+        self.assertIsNone(result["next_offset"])
+
+    def test_invalid_future_and_out_of_range_history_reads_are_observed_errors(self):
+        for action in (
+            {"step": True}, {"step": 0}, {"step": -1}, {"step": 2}, {"step": "1"},
+            {"step": 1, "offset": True}, {"step": 1, "offset": -1},
+            {"step": 1, "offset": 1.5}, {"step": 1, "offset": 100000},
+        ):
+            with self.subTest(action=action):
+                self.assertIn("error", history_observation([self.record()], action, ()))
+
+    def test_ledger_redacts_before_preview_truncation_and_never_mutates_original_steps(self):
+        action = {"action": "run", "argv": ["x" * 280 + TASK_KEY]}
+        record = self.record(action)
+        recent = self.record({"action": "read_file", "path": "source.sol"})
+        initial = [{"role": "system", "content": "original system"},
+                   {"role": "user", "content": "original task"}]
+        messages = compact_history(initial, [record, recent], 1, (TASK_KEY,))
+        self.assertEqual(messages[0], initial[0])
+        self.assertEqual(messages[1]["content"].split(HISTORY_MARKER)[0], "original task")
+        self.assertEqual(initial[1]["content"], "original task")
+        self.assertNotIn("ALCHEMY_TEST", messages[1]["content"])
+        self.assertIn("[REDACTED]", messages[1]["content"])
+        self.assertEqual(record["action"]["argv"], ["x" * 280 + TASK_KEY])
+        self.assertEqual(messages[-2]["content"], decision(recent["action"])["choices"][0]["message"]["content"])
+        self.assertEqual(json.loads(messages[-1]["content"].split("\n", 1)[1]), recent["observation"])
+
+    def test_history_action_is_in_the_schema_and_rejects_extra_fields(self):
+        action = {"action": "read_history", "step": 1, "offset": 0}
+        self.assertEqual(parse_action(decision(action)), action)
+        self.assertTrue(any(
+            row["properties"]["action"]["const"] == "read_history" for row in ACTION_SCHEMA["oneOf"]
+        ))
+        with self.assertRaises(JobError):
+            parse_action(decision({**action, "path": "../other-run"}))
 
 
 if __name__ == "__main__":

@@ -138,8 +138,13 @@ request signing keys, or use a live network for transaction execution.
    Cite the saved source file and actual function names for each explanation.
    Distinguish observed source behavior from assumptions. Include the sampled
    addresses, block, native ETH balances, and the commands that ran successfully.
-   Write the report directly with `write_file`; a separate report-generating
-   program is unnecessary. Include a short access-control table listing
+   Create a small extraction/rendering helper to derive function names,
+   declarations and named modifiers from the actual saved source. Keep your
+   source-grounded caller-condition notes in structured data and render the
+   Markdown tables from the extracted values, rather than retyping signatures
+   or guessing layout. Inspect bodies separately; a declaration alone does
+   not establish caller conditions or state transitions.
+   Include a short access-control table listing
    sensitive functions, their actual modifiers, and their caller conditions.
    Inspect each individual declaration/body, not ERC-20 stereotypes:
    Include a short exact declaration or condition from the saved source beside

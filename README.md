@@ -56,40 +56,45 @@ For a longer or sensitive prompt, create a UTF-8 file and use `--prompt-file ./r
 
 ```bash
 python run_job.py agent \
-  --model-repo unsloth/Qwen3-Coder-480B-A35B-Instruct-GGUF \
-  --model-file Q3_K_S/Qwen3-Coder-480B-A35B-Instruct-Q3_K_S-00001-of-00005.gguf \
+  --model-repo unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF \
+  --model-file Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf \
+  --model-revision b17cb02dd882d5b6ab62fc777ad2995f19668350 \
+  --template-hash 5ec457ba5e023038cdcfe7d4aab5c207 \
   --prompt-file ./examples/hardhat-research.md \
   --verify-script ./examples/verify_hardhat_research.py \
   --agent-env ALCHEMY_API_KEY \
   --agent-env ETHERSCAN_API_KEY \
-  --gpu-policy a100-only \
-  --gpu-count 8 \
-  --max-hourly-price 7.52 \
-  --max-bandwidth-price 0.015625 \
-  --timeout-minutes 60 \
-  --disk-gb 400 \
-  --context-size 65536 \
-  --max-steps 40 \
+  --gpu-policy prefer-a100 \
+  --max-hourly-price 0.60 \
+  --max-bandwidth-price 0.003 \
+  --timeout-minutes 30 \
+  --disk-gb 64 \
+  --context-size 49152 \
+  --max-steps 60 \
   --max-tokens 4096
 ```
 
 This is a paid run. Add `--dry-run` to inspect the model/template/offer without executing actions or renting an instance. The supplied [Hardhat task](examples/hardhat-research.md) instructs the agent to create and execute its own scripts on a local Ethereum mainnet fork, read native ETH balances for two randomly sampled verified contracts, fetch deployed bytecode through Alchemy, obtain verified Solidity through Etherscan, and write a source-grounded report. **Alchemy `eth_getCode` returns bytecode, not verified Solidity.** No transactions, deployment, or wallet credentials are needed.
 
-The larger agent example uses Qwen3-Coder-480B-A35B, a 480B-total/35B-active mixture-of-experts model, with approximately 207 GB of Q3_K_S GGUF weights across five files. It requires a multi-GPU instance such as eight 40 GB A100s. Active parameters do not reduce the memory needed to fully offload all model weights. This lower-precision choice reduces download cost versus its approximately 290 GB Q4_K_M set, but model size and quantization do not guarantee reasoning accuracy. Earlier 8B, 30B/3B-active MoE, and 32B coder attempts did not complete this scenario reliably; inspect actual execution and source evidence.
+Start with the single-GPU Qwen3-Coder-30B-A3B example above: its Q4_K_M download is approximately 18.56 GB. A 24 GB GPU still needs additional memory for context/cache/runtime, and actual full offload and serving context are checked before actions. Hourly and bandwidth limits are quote caps, not an all-in dollar-budget guarantee. Account for startup, model/dependency traffic, storage and cleanup before renting.
 
-At an observed eight-A100 quote of $7.5126/hour and $0.015625/GB ingress, the Q3_K_S weights cost approximately $3.23 to download. The 60-minute example deadline plus five-minute cleanup costs approximately $8.14 at that hourly quote, before other traffic and billing updates. This is a cost estimate, not an invoice guarantee; recheck the dry-run quote and obtain sufficient approval before renting.
+Qwen3-Coder-480B-A35B is an optional larger model, not the smoke-test default. Its 480B-total/35B-active mixture of experts needs approximately 207 GB of Q3_K_S weights across five files and a multi-GPU instance such as eight 40 GB A100s. Its repository is `unsloth/Qwen3-Coder-480B-A35B-Instruct-GGUF`; select `Q3_K_S/Qwen3-Coder-480B-A35B-Instruct-Q3_K_S-00001-of-00005.gguf` and size GPU count, disk, time and budget explicitly. Active parameters do not reduce the memory needed to fully offload all weights. Model size and quantization do not guarantee reasoning accuracy.
 
-The real 480B test verified all five shards, all eight A100s, 63/63 GPU-offloaded layers and actual 65,536-token serving capacity. However, cold setup/download/loading consumed nearly the entire 43-minute budgeted run: the agent completed only its `package.json` write and began `npm install` before timing out. No research scripts or report were produced. Partial evidence was retrieved and instance destruction independently confirmed. Updated recorded charges were $9.312 when checked, subject to updates. This is a successful model-loading check, **not a successful Hardhat research result**; the longer example timeout needs a separately approved larger budget.
+At an observed eight-A100 quote of $7.5126/hour and $0.015625/GB ingress, the Q3_K_S weights alone cost approximately $3.23 to download. A 60-minute deadline plus five-minute cleanup costs approximately $8.14 at that hourly quote, before other traffic and billing updates. This is a cost estimate, not an invoice guarantee; recheck the dry-run quote and obtain sufficient approval before renting.
+
+The real 480B test verified all five shards, all eight A100s, 63/63 GPU-offloaded layers and actual 65,536-token serving capacity. However, cold setup/download/loading consumed nearly the entire 43-minute budgeted run: the agent completed only its `package.json` write and began `npm install` before timing out. No research scripts or report were produced. Partial evidence was retrieved and instance destruction independently confirmed. Recorded charges were $9.312: $5.672 GPU, $0.205 storage, $3.344 download and $0.091 upload, subject to updates. This is a successful model-loading check, **not a successful Hardhat research result**.
 
 A separate Qwen3-Coder-Next **80B Q4_K_S** test on a 48 GB RTX A6000 executed both Hardhat/source scripts and retrieved genuine Dai/WETH9 Solidity. Its finish was rejected because it saved Etherscan `result[0]` instead of the complete API envelope; its report also contains incorrect prose and declaration/modifier details. It reached the decision limit without an accepted finish. A targeted continuation never reached SSH and was destroyed.
 
-A subsequent **30B/3B-active Q4_K_M** continuation on an RTX 3090 reached SSH too late in its 40-minute window and timed out during Node bootstrap. A CUDA-only Titan RTX attempt reached SSH after about 15 minutes and installed the prerequisites, but failed before model download because Ubuntu 22.04's CMake 3.22 cannot interpret CUDA architecture `native`. The worker now queries the actual devices and passes explicit numeric architectures instead. All five instances were independently confirmed absent. Their combined recorded charges were $9.561, leaving $0.439 of the renewed $10 authorization, subject to billing updates. Another paid run requires fresh aggregate billing and a complete-cost check, including cleanup, traffic and late-billing reserves. **End-to-end source-grounded research is not yet verified.** Partial artifacts remain diagnostic evidence, not a successful result.
+A subsequent **30B/3B-active Q4_K_M** continuation on an RTX 3090 reached SSH too late in its 40-minute window and timed out during Node bootstrap. A CUDA-only Titan RTX attempt reached SSH after about 15 minutes and installed the prerequisites, but failed before model download because Ubuntu 22.04's CMake 3.22 cannot interpret CUDA architecture `native`. The worker now queries the actual devices and passes explicit numeric architectures instead. A faster RTX 3090 then completed CUDA setup, full 49/49 offload and both real research scripts, but failed after 27 decisions when retained history exhausted its 49,152-token context. Its report had not passed verification. All six instances were independently confirmed absent. Their last recorded combined charges were $9.672 under that previous $10 authorization, subject to updates. **End-to-end source-grounded research is not yet verified.** Partial artifacts remain diagnostic evidence, not a successful result.
 
-The research example uses a 65,536-token context because retained script/tool/source history exceeded 32,768 tokens in a real attempt. It reserves 4,096 output tokens per decision so the source-evidence report tables fit. The pinned server caps usable slots to the GGUF's training context even if `--context-size` requests more; the worker checks `/props` after startup and fails before generation if the actual single-slot capacity is smaller. Increasing the allocation alone did not extend the tested Qwen2.5-Coder model's 32,768-token limit. The workflow also fails explicitly instead of silently discarding evidence when history plus reserved output exceeds the verified limit. Keep metadata output compact, avoid dumping bytecode/ABI, and choose context capacity supported by both the model and GPU.
+The research example uses a 49,152-token context and reserves 4,096 output tokens per decision. The pinned server caps usable slots to the GGUF's training context even if `--context-size` requests more; the worker checks `/props` after startup and fails before generation if the actual single-slot capacity is smaller. Increasing the allocation alone did not extend the tested Qwen2.5-Coder model's 32,768-token limit.
+
+Before sending an oversized agent prompt, the worker replaces older steps with an explicitly marked action/status ledger, retaining the system instructions, original task and newest observation. It remeasures the rendered prompt, including reserved output, before generation. Original steps remain unchanged in the full transcript and are available to the model with `{"action":"read_history","step":1,"offset":0}`. History reads use bounded UTF-8 byte pagination, do not execute old actions, and redact known credentials before calculating offsets. Compaction events are recorded in the transcript and counted in the agent report. If the original task, ledger and newest observation still cannot fit, the run fails explicitly rather than silently dropping them. Keep metadata output compact and avoid dumping bytecode, ABI or license text into context.
 
 Add `ALCHEMY_API_KEY` and `ETHERSCAN_API_KEY` to the selected `.env` for this example. Each `--agent-env NAME` forwards only that named variable to command processes over SSH stdin. Process-environment precedence is unchanged. Missing/empty selected variables fail before rental. The VastAI/Hugging Face credentials and identity/interpreter variables cannot be forwarded this way. Values are not included in model messages or metadata.
 
-Available actions are `run` with an argv array, `read_file`, `write_file`, `list_files`, and `finish`. CLI arguments are not implicitly shell-expanded. File tools support only relative paths inside the workspace, reject symlinks/hardlinks, and create missing parent directories for writes. `read_file` returns a byte `next_offset` for paginated UTF-8 reading. Node **v22.23.3**, npm, and Python are available remotely; the Node archive is checked against its pinned official SHA-256. Package installs run without root privileges.
+Available actions are `run` with an argv array, `read_file`, `read_history`, `write_file`, `list_files`, and `finish`. CLI arguments are not implicitly shell-expanded. File tools support only relative paths inside the workspace, reject symlinks/hardlinks, and create missing parent directories for writes. `read_file` and `read_history` return a byte `next_offset` for paginated UTF-8 reading. History access is limited to earlier completed steps in the current run, not arbitrary files or other runs. Node **v22.23.3**, npm, and Python are available remotely; the Node archive is checked against its pinned official SHA-256. Package installs run without root privileges.
 
 | Agent option | Default | Meaning |
 | --- | --- | --- |
@@ -137,7 +142,7 @@ modeloutput/<run-id>/
 
 `response.txt` is the summary from the final JSON decision, not an OpenAI completion envelope. The report records outcome, limits, decisions, and the workspace manifest/checksums. The transcript preserves decisions, model completions, and actual tool observations; it can contain private task/file content. There is no `completion.json` for agent mode. Dependencies/caches named `node_modules`, `.git`, `.venv`, `venv`, `__pycache__`, `.cache`, or `.npm` are intentionally excluded and listed in the manifest. Keep the returned package manifest/lockfile to reinstall dependencies.
 
-Credential-bearing files or unsafe/oversized archives are refused rather than silently copied. Generated script bytes are not rewritten. Tool failures are returned to the model for correction, with a recovery hint after three consecutive failures; five consecutive failures stop the run explicitly. Malformed or token-limited decisions never execute; context overflow and exhausted step/job budgets fail explicitly. Failed runs preserve available partial scripts, outputs, and transcripts before teardown. Finishing alone is not evidence that every task claim is correct: inspect the execution transcript and source references.
+Credential-bearing files or unsafe/oversized archives are refused rather than silently copied. Generated script bytes are not rewritten. Tool failures are returned to the model for correction, with a recovery hint after three consecutive failures; five consecutive failures stop the run explicitly. Malformed or token-limited decisions never execute; unrecoverable context overflow and exhausted step/job budgets fail explicitly. Failed runs preserve available partial scripts, outputs, and transcripts before teardown. Finishing alone is not evidence that every task claim is correct: inspect the execution transcript and source references.
 
 ## Inputs and defaults
 

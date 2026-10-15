@@ -17,7 +17,7 @@ import sys
 from typing import TYPE_CHECKING, Any, Iterator
 
 from job_utils import (
-    Deadline, DeadlineExceeded, JobError, LLAMA_COMMIT, MAX_WORKER_REQUEST_BYTES, atomic_write,
+    ContextLimitError, Deadline, DeadlineExceeded, JobError, LLAMA_COMMIT, MAX_WORKER_REQUEST_BYTES, atomic_write,
     commit_sha, completion_text, error_text, model_filenames, number,
     object_value, positive_int, redact, run_command, sha256_file,
     stop_process, write_json,
@@ -403,10 +403,7 @@ class ModelRuntime:
             ):
                 raise JobError("Model returned invalid agent context token counts.")
             if len(tokens) + self.max_tokens > self.context_size:
-                raise JobError(
-                    f"Agent history needs {len(tokens)} input tokens plus {self.max_tokens} output tokens; "
-                    f"context limit is {self.context_size}. Increase --context-size or reduce tool output."
-                )
+                raise ContextLimitError(len(tokens), self.max_tokens, self.context_size)
             payload["response_format"] = {"type": "json_object", "schema": schema}
         completion = self.post("/v1/chat/completions", payload, deadline)
         completion_text(completion)

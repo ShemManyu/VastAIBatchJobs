@@ -18,6 +18,23 @@ class ToolError(Exception):
     pass
 
 
+def text_chunk(data: bytes, maximum: int, offset: int) -> dict[str, Any]:
+    truncated = len(data) > maximum
+    data = data[:maximum]
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        if truncated and error.end == len(data) and error.reason == "unexpected end of data":
+            data = data[:error.start]
+            text = data.decode("utf-8")
+        else:
+            raise ToolError("Text reads require UTF-8 text at a character boundary.") from error
+    return {
+        "content": text, "offset": offset, "bytes_read": len(data), "truncated": truncated,
+        "next_offset": offset + len(data) if truncated else None,
+    }
+
+
 def path_parts(value: object, *, allow_root: bool = False) -> list[str]:
     if allow_root and value == ".":
         return []
@@ -87,21 +104,7 @@ def file_action(workspace: Path, action: dict[str, Any], maximum: int) -> dict[s
                 raise ToolError("read_file offset exceeds the file size.")
             source.seek(offset)
             data = source.read(maximum + 1)
-        truncated = len(data) > maximum
-        data = data[:maximum]
-        try:
-            text = data.decode("utf-8")
-        except UnicodeDecodeError as error:
-            if truncated and error.end == len(data) and error.reason == "unexpected end of data":
-                data = data[:error.start]
-                text = data.decode("utf-8")
-            else:
-                raise ToolError("read_file requires UTF-8 text; use a script to inspect binary files.") from error
-        return {
-            "path": action["path"], "content": text, "offset": offset,
-            "bytes_read": len(data), "truncated": truncated,
-            "next_offset": offset + len(data) if truncated else None,
-        }
+        return {"path": action["path"], **text_chunk(data, maximum, offset)}
     finally:
         os.close(parent)
 

@@ -28,6 +28,17 @@ class DeadlineExceeded(JobError):
     pass
 
 
+class ContextLimitError(JobError):
+    def __init__(self, input_tokens: int, output_tokens: int, context_size: int) -> None:
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+        self.context_size = context_size
+        super().__init__(
+            f"Agent history needs {input_tokens} input tokens plus {output_tokens} output tokens; "
+            f"context limit is {context_size}. Increase --context-size or reduce tool output."
+        )
+
+
 class Deadline:
     def __init__(
         self,
