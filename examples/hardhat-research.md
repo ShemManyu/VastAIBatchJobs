@@ -144,6 +144,10 @@ request signing keys, or use a live network for transaction execution.
    Markdown tables from the extracted values, rather than retyping signatures
    or guessing layout. Inspect bodies separately; a declaration alone does
    not establish caller conditions or state transitions.
+   Derive allowed named modifiers from actual `modifier NAME` declarations,
+   including inherited ones. Match only those names in function headers and
+   render `none` for an empty set; tokens after the parameter list can also
+   contain visibility and `returns`, not just named modifiers.
    Include a short access-control table listing
    sensitive functions, their actual modifiers, and their caller conditions.
    Inspect each individual declaration/body, not ERC-20 stereotypes:

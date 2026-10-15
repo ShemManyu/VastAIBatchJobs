@@ -336,6 +336,54 @@ class AgentLoopTests(unittest.TestCase):
         self.assertIn("recovery_hint", transcript["steps"][2]["observation"])
         self.assertFalse((self.root / "response.txt").exists())
 
+    def test_identical_finish_failures_stop_after_five_despite_successful_intervening_edits(self):
+        actions = []
+        for version in range(6):
+            actions.extend([
+                {"action": "write_file", "path": "report.md", "content": f"Incorrect revision {version}"},
+                {"action": "finish", "summary": "Claimed correction."},
+            ])
+        report = self.run_actions(actions, options=AgentOptions(
+            max_steps=12, verification_code="raise SystemExit('Named modifiers must be none.')",
+        ))
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["steps"], 10)
+        self.assertEqual(len(self.model_requests), 10)
+        self.assertIn("five identical finish rejections", report["error"])
+        self.assertFalse((self.root / "response.txt").exists())
+        transcript = json.loads((self.root / "agent-transcript.json").read_text())
+        rejected = transcript["steps"][1::2]
+        self.assertEqual(
+            [step["observation"]["repeated_finish_rejections"] for step in rejected], [1, 2, 3, 4, 5],
+        )
+        self.assertIn("recovery_hint", rejected[2]["observation"])
+        self.assertTrue(all(step["observation"]["verification"]["exit_code"] == 1 for step in rejected))
+        self.assertEqual((self.sandbox.workspace / "report.md").read_text(), "Incorrect revision 4")
+        self.assertEqual([row["path"] for row in report["archive"]["manifest"]["files"]], ["report.md"])
+
+    def test_changed_verifier_failure_resets_repeat_count_and_allows_real_correction(self):
+        code = (
+            "from pathlib import Path\nvalue = Path('value.txt').read_text()\n"
+            "if value != '42': raise SystemExit('Incorrect value: ' + value)\n"
+            "print('Verified 42.')\n"
+        )
+        actions = []
+        for value in ["first"] * 4 + ["second", "42"]:
+            actions.extend([
+                {"action": "write_file", "path": "value.txt", "content": value},
+                {"action": "finish", "summary": "The corrected value was verified."},
+            ])
+        report = self.run_actions(actions, options=AgentOptions(max_steps=12, verification_code=code))
+        self.assertEqual(report["status"], "completed")
+        self.assertEqual(report["steps"], 12)
+        self.assertEqual(report["verification"]["stdout"], "Verified 42.\n")
+        transcript = json.loads((self.root / "agent-transcript.json").read_text())
+        self.assertEqual(
+            [step["observation"]["repeated_finish_rejections"] for step in transcript["steps"][1:10:2]],
+            [1, 2, 3, 4, 1],
+        )
+        self.assertTrue(transcript["steps"][-1]["observation"]["finished"])
+
     def test_step_limit_is_exact_and_preserves_partial_scripts_and_execution_evidence(self):
         report = self.run_actions([
             {"action": "write_file", "path": "partial.py", "content": "print(7)\n"},

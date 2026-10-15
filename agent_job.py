@@ -478,6 +478,8 @@ def run_agent(
     }
     archive_info: dict[str, Any] | None = None
     consecutive_failures = 0
+    identical_finish_failures = 0
+    last_finish_error: str | None = None
     try:
         for step in range(1, options.max_steps + 1):
             actions_deadline.remaining()
@@ -529,6 +531,17 @@ def run_agent(
                     observation = {"error": "Finish rejected: " + error_text(error, secrets)}
                     if verification is not None:
                         observation["verification"] = verification
+                    finish_error = json.dumps(observation, sort_keys=True, ensure_ascii=False)
+                    identical_finish_failures = (
+                        identical_finish_failures + 1 if finish_error == last_finish_error else 1
+                    )
+                    last_finish_error = finish_error
+                    observation["repeated_finish_rejections"] = identical_finish_failures
+                    if identical_finish_failures >= 3:
+                        observation["recovery_hint"] = (
+                            "The same finish check keeps failing. Fix the underlying artifact-generation "
+                            "logic instead of repeating ineffective report edits."
+                        )
                 else:
                     record["observation"] = {"finished": True}
                     if verification is not None:
@@ -548,12 +561,14 @@ def run_agent(
             )
             consecutive_failures = consecutive_failures + 1 if failed else 0
             if consecutive_failures >= 3:
-                observation["recovery_hint"] = (
+                observation.setdefault("recovery_hint", (
                     "Repeated failures: inspect the actual error and relevant files. "
                     "Recheck the task; do not keep guessing unrelated packages or versions."
-                )
+                ))
             record["observation"] = observation
             write_json(root / "agent-transcript.json", scrub_values(transcript, secrets))
+            if identical_finish_failures >= 5:
+                raise JobError("Agent could not recover from five identical finish rejections.")
             if consecutive_failures >= 5:
                 raise JobError("Agent could not recover from five consecutive tool failures.")
             messages.append({"role": "assistant", "content": completion_text(completion)})
