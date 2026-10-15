@@ -1,4 +1,6 @@
+from contextlib import redirect_stderr, redirect_stdout
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -8,7 +10,58 @@ from unittest.mock import patch
 import urllib.parse
 
 from agent_utils import MAX_VERIFICATION_BYTES
-from examples.verify_hardhat_research import PINS, verify, verify_report_section
+from examples.verify_hardhat_research import PINS, main, verify, verify_commands, verify_report_section
+
+
+class CommandEvidenceTests(unittest.TestCase):
+    def records(self):
+        return [
+            {"action": {"action": "run", "argv": argv}, "observation": {
+                "exit_code": 0, "timed_out": False, "stdout": '{"actual":true}\n',
+                "stdout_truncated": False,
+            }}
+            for argv in (
+                ["npx", "hardhat", "run", "scripts/read-balances.cjs", "--no-compile"],
+                ["node", "scripts/fetch-sources.cjs"],
+            )
+        ]
+
+    def test_requires_both_actual_current_commands_with_complete_nonempty_stdout(self):
+        self.assertIsNone(verify_commands(self.records()))
+        for mutation in (
+            {"exit_code": -6}, {"exit_code": False}, {"timed_out": True},
+            {"error": "failed child"}, {"stdout": ""}, {"stdout_truncated": True},
+        ):
+            with self.subTest(mutation=mutation):
+                records = self.records()
+                records[0]["observation"].update(mutation)
+                with self.assertRaises(ValueError):
+                    verify_commands(records)
+        for records in ([], self.records()[:1], self.records()[1:]):
+            with self.subTest(records=records), self.assertRaises(ValueError):
+                verify_commands(records)
+
+    def test_printing_old_json_or_a_later_failed_attempt_is_not_current_execution(self):
+        records = self.records()
+        records[0]["action"]["argv"] = ["node", "-e", "console.log('prior JSON')"]
+        with self.assertRaises(ValueError):
+            verify_commands(records)
+        records = self.records()
+        records.append({**records[0], "observation": {"exit_code": -6, "timed_out": False}})
+        with self.assertRaises(ValueError):
+            verify_commands(records)
+
+    def test_verifier_entrypoint_requires_current_command_evidence_before_api_checks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "commands.json"
+            for commands, expected in ((self.records(), 0), ([], 1)):
+                with self.subTest(commands=commands):
+                    path.write_text(json.dumps(commands))
+                    with patch("examples.verify_hardhat_research.sys.argv", ["-c", str(path)]), \
+                         patch("examples.verify_hardhat_research.verify", return_value={"status": "verified"}) as data, \
+                         redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                        self.assertEqual(main(), expected)
+                    self.assertEqual(data.call_count, 1 if expected == 0 else 0)
 
 
 class SelfTransferConditionTests(unittest.TestCase):
@@ -17,6 +70,8 @@ class SelfTransferConditionTests(unittest.TestCase):
     def report(self, contract, name, modifiers, condition, declaration):
         return (
             f"## {contract} ({self.address})\n\n"
+            "Purpose: Source-defined contract behavior.\n"
+            "State transitions: Apply the declared function behavior.\n\n"
             "| Function | Modifiers | Caller conditions | Source declaration |\n"
             "| --- | --- | --- | --- |\n"
             f"| {name} | {modifiers} | {condition} | `{declaration}` |\n"
@@ -123,6 +178,8 @@ class HardhatVerifierTests(unittest.TestCase):
             })
             report.append(
                 f"## Example ({address})\nSource: {source_path}\n\n"
+                "Purpose: Demonstrate the verified function declarations.\n"
+                "State transitions: The example function has an empty body.\n\n"
                 "| Function | Modifiers | Caller conditions | Source declaration |\n"
                 "| --- | --- | --- | --- |\n"
                 + "\n".join(
@@ -162,6 +219,18 @@ class HardhatVerifierTests(unittest.TestCase):
         self.assertEqual({row["runtime_code_bytes"] for row in result["contracts"]}, {3})
         self.assertEqual({row["report_function_count"] for row in result["contracts"]}, {1})
         self.assertEqual(self.request.call_count, 7)
+
+    def test_tables_alone_do_not_satisfy_purpose_and_state_transition_prose(self):
+        path = self.root / "report.md"
+        original = path.read_text()
+        for line in (
+            "Purpose: Demonstrate the verified function declarations.\n",
+            "State transitions: The example function has an empty body.\n",
+        ):
+            with self.subTest(line=line):
+                path.write_text(original.replace(line, "", 1))
+                with self.assertRaisesRegex(ValueError, "include nonempty"):
+                    verify(self.root)
 
     def test_flat_source_record_gets_actionable_saved_response_feedback(self):
         path = self.root / self.contracts["contracts"][0]["etherscan_response_path"]

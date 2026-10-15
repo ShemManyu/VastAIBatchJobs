@@ -77,6 +77,9 @@ request signing keys, or use a live network for transaction execution.
    ```
    Replace all placeholders with observed values; there must be two contracts.
    A zero ETH balance is valid, but empty contract code is not.
+   Both required commands must succeed with complete nonempty stdout in THIS
+   run. The caller checks its protected command history. Printing old output
+   files or listing commands in the report does not establish execution.
    Keep the same sampled addresses while correcting an error. Do not resample
    as a response to a format/API/report failure.
 4. Create and execute `scripts/fetch-sources.cjs` with
@@ -155,7 +158,9 @@ request signing keys, or use a live network for transaction execution.
    each access-control claim. Keep each contract's functions in its own section:
    Dai's `wards`, `rely`, `deny`, and `auth` do not exist in LINK or WETH9.
    Start each contract section with `## CONTRACT_NAME (ADDRESS)`, using its
-   actual verified name and selected address. Include exactly one table with
+   actual verified name and selected address. Add nonempty paragraphs beginning
+   with `Purpose:` and `State transitions:` that explain actual source behavior.
+   Tables alone do not satisfy this requirement. Include exactly one table with
    this header:
    `| Function | Modifiers | Caller conditions | Source declaration |`
    Cover every named public/external function defined in the source, including

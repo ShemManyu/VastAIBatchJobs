@@ -12,7 +12,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from agent_job import (
-    ACTION_SCHEMA, HISTORY_MARKER, Sandbox, bootstrap_tools, compact_history,
+    ACTION_SCHEMA, HISTORY_MARKER, Sandbox, agent_uid, bootstrap_tools, compact_history,
     history_observation, parse_action, run_agent, scrub_values,
 )
 from agent_tools import ToolError, execute
@@ -280,7 +280,7 @@ class AgentLoopTests(unittest.TestCase):
         self.assertIn("Expected the computed value 42.", observation["verification"]["stderr"])
         verifier_calls = [action for action in self.sandbox.actions if action["action"] == "run"]
         self.assertEqual(len(verifier_calls), 2)
-        self.assertTrue(all(action["argv"][-1] == code for action in verifier_calls))
+        self.assertTrue(all(action["argv"][4] == code for action in verifier_calls))
         self.assertTrue(all("-I" in action["argv"] and "-S" in action["argv"] for action in verifier_calls))
         transcript = json.loads((self.root / "agent-transcript.json").read_text())
         self.assertNotIn("finished", transcript["steps"][2]["observation"])
@@ -306,7 +306,57 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(report["status"], "completed")
         self.assertEqual(report["verification"]["exit_code"], 0)
         self.assertEqual(report["verification"]["stdout"], "maximum verifier executed\n")
-        self.assertEqual(len(self.sandbox.actions[0]["argv"][-1].encode()), MAX_VERIFICATION_BYTES)
+        self.assertEqual(len(self.sandbox.actions[0]["argv"][4].encode()), MAX_VERIFICATION_BYTES)
+
+    def test_verifier_gets_real_current_commands_not_workspace_success_claims(self):
+        code = (
+            "import json,sys\nfrom pathlib import Path\n"
+            "commands=json.loads(Path(sys.argv[1]).read_text())\n"
+            "assert commands and commands[-1]['observation']['exit_code']==0, 'No actual successful command'\n"
+            "assert commands[-1]['observation']['stdout']=='42\\n', 'No actual computed output'\n"
+            "print(json.dumps(commands))\n"
+        )
+        report = self.run_actions([
+            {"action": "write_file", "path": "verification-context.json", "content": '[{"claimed_success":true}]'},
+            {"action": "run", "argv": [sys.executable, "-c", "raise SystemExit(7)"]},
+            {"action": "finish", "summary": "Prior JSON says it worked."},
+            {"action": "run", "argv": [sys.executable, "-c", "print(6*7)"]},
+            {"action": "finish", "summary": "The actual current command computed 42."},
+        ], options=AgentOptions(verification_code=code))
+        self.assertEqual(report["status"], "completed", report.get("error"))
+        self.assertEqual(report["steps"], 5)
+        commands = json.loads(report["verification"]["stdout"])
+        self.assertEqual([row["step"] for row in commands], [2, 4])
+        self.assertEqual([row["observation"]["exit_code"] for row in commands], [7, 0])
+        self.assertEqual(commands[-1]["action"]["argv"], [sys.executable, "-c", "print(6*7)"])
+        transcript = json.loads((self.root / "agent-transcript.json").read_text())
+        self.assertNotEqual(transcript["steps"][2]["observation"]["verification"]["exit_code"], 0)
+        self.assertEqual(
+            json.loads((self.sandbox.workspace / "verification-context.json").read_text()),
+            [{"claimed_success": True}],
+        )
+        self.assertFalse((self.sandbox.helper.parent / "verification-context.json").exists())
+
+    def test_command_context_is_redacted_read_only_and_removed_after_verification(self):
+        code = (
+            "import json,sys\nfrom pathlib import Path\n"
+            "path=Path(sys.argv[1])\n"
+            "assert path.stat().st_mode & 0o222 == 0, 'Context must not be writable'\n"
+            f"assert {TASK_KEY!r} not in path.read_text(), 'Context must redact command arguments too'\n"
+            "commands=json.loads(path.read_text())\n"
+            "assert commands[0]['observation']['stdout']=='[REDACTED]\\n'\n"
+            "print('private command evidence verified')\n"
+        )
+        report = self.run_actions([
+            {"action": "run", "argv": [
+                sys.executable, "-c", f"print({TASK_KEY!r})",
+            ]},
+            {"action": "finish", "summary": "Actual output was checked without exposing the task key."},
+        ], options=AgentOptions(verification_code=code))
+        self.assertEqual(report["status"], "completed", report.get("error"))
+        self.assertEqual(report["verification"]["stdout"], "private command evidence verified\n")
+        self.assertNotIn(TASK_KEY, (self.root / "agent-transcript.json").read_text())
+        self.assertFalse((self.sandbox.helper.parent / "verification-context.json").exists())
 
     def test_finish_requires_a_completed_verifier_not_a_timeout_or_success_shaped_error(self):
         for verification in (
@@ -444,6 +494,50 @@ class AgentLoopTests(unittest.TestCase):
 
 
 class RuntimeAndIsolationTests(unittest.TestCase):
+    def test_agent_uid_uses_an_unused_high_mapped_uid_instead_of_shared_system_identity(self):
+        with patch("agent_job.Path.read_text", return_value="0 0 4294967295\n"), \
+             patch("agent_job.uuid.uuid4", side_effect=[SimpleNamespace(int=7), SimpleNamespace(int=8)]), \
+             patch("agent_job.pwd.getpwuid", side_effect=[SimpleNamespace(pw_uid=1000007), KeyError]) as lookup:
+            self.assertEqual(agent_uid(), 1000008)
+        self.assertEqual([call.args[0] for call in lookup.call_args_list], [1000007, 1000008])
+
+    def test_agent_uid_stays_inside_restricted_mapping_and_rejects_root_only_namespace(self):
+        with patch("agent_job.Path.read_text", return_value="0 100000 65536\n"), \
+             patch("agent_job.uuid.uuid4", return_value=SimpleNamespace(int=7)), \
+             patch("agent_job.pwd.getpwuid", side_effect=KeyError):
+            self.assertEqual(agent_uid(), 10007)
+        with patch("agent_job.Path.read_text", return_value="0 100000 1\n"), self.assertRaises(JobError):
+            agent_uid()
+
+    def test_prepare_requests_exact_uid_without_large_login_logs_and_checks_native_async_runtime(self):
+        for exit_code in (0, -6):
+            with self.subTest(exit_code=exit_code), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary) / "worker"
+                root.mkdir()
+                (root / "agent_tools.py").write_text("# fixture helper\n")
+                sandbox = Sandbox(root, AgentOptions(), {}, ())
+                native = {
+                    "exit_code": exit_code, "timed_out": False,
+                    "stdout": "agent-runtime-ok\n" if exit_code == 0 else "",
+                }
+                with patch("agent_job.platform.system", return_value="Linux"), \
+                     patch("agent_job.os.geteuid", return_value=0), \
+                     patch("agent_job.agent_uid", return_value=1000007), \
+                     patch("agent_job.run_command") as command, \
+                     patch("agent_job.pwd.getpwnam", return_value=SimpleNamespace(pw_uid=1000007, pw_gid=2002)), \
+                     patch("agent_job.os.chown"), \
+                     patch.object(sandbox, "execute", side_effect=[{"entries": []}, native]) as execute:
+                    if exit_code == 0:
+                        sandbox.prepare(Deadline(10))
+                        self.assertEqual(sandbox.uid, 1000007)
+                    else:
+                        with self.assertRaisesRegex(JobError, "Node async runtime probe failed"):
+                            sandbox.prepare(Deadline(10))
+                argv = command.call_args.args[0]
+                self.assertEqual(argv[argv.index("--uid") + 1], "1000007")
+                self.assertIn("--no-log-init", argv)
+                self.assertEqual(execute.call_args_list[-1].args[0]["argv"][:2], ["node", "-e"])
+
     def test_remote_agent_uses_the_snapshot_and_rejects_a_missing_or_changed_verifier(self):
         code = "print('REMOTE_VERIFICATION_SNAPSHOT')\n"
         options = AgentOptions(verification_code=code)

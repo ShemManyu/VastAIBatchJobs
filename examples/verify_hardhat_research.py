@@ -65,6 +65,22 @@ def artifact(root: Path, name: object) -> Path:
     return candidate
 
 
+def verify_commands(commands: list[dict[str, Any]]) -> None:
+    for argv in (
+        ["npx", "hardhat", "run", "scripts/read-balances.cjs", "--no-compile"],
+        ["node", "scripts/fetch-sources.cjs"],
+    ):
+        result = next((row["observation"] for row in reversed(commands)
+                       if row.get("action", {}).get("argv") == argv), {})
+        require(
+            type(result.get("exit_code")) is int and result["exit_code"] == 0
+            and result.get("timed_out") is False and "error" not in result
+            and isinstance(result.get("stdout"), str) and bool(result["stdout"].strip())
+            and result.get("stdout_truncated") is False,
+            "Execute successfully with nonempty complete stdout in THIS run: " + " ".join(argv),
+        )
+
+
 def verify_report_section(summary: str, address: str, contract_name: str, source: str) -> int:
     headings = list(re.finditer(r"(?m)^##[ \t]+[^\n]+", summary))
     selected = [index for index, heading in enumerate(headings) if address.lower() in heading[0].lower()]
@@ -73,6 +89,9 @@ def verify_report_section(summary: str, address: str, contract_name: str, source
     require(contract_name.lower() in headings[index][0].lower(), "Report section needs the verified contract name.")
     end = headings[index + 1].start() if index + 1 < len(headings) else len(summary)
     section = summary[headings[index].end():end]
+    for label in ("Purpose", "State transitions"):
+        require(re.search(r"(?mi)^\*{0,2}" + label + r":\*{0,2}[ \t]+\S", section) is not None,
+                f"{contract_name}: include nonempty {label}: prose.")
     masked = re.sub(
         r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|//[^\n]*|/\*.*?\*/',
         lambda match: " " * len(match[0]), source, flags=re.DOTALL,
@@ -202,12 +221,12 @@ def verify(root: Path) -> dict[str, Any]:
         require(
             isinstance(row.get("balance_wei"), str)
             and re.fullmatch(r"0|[1-9][0-9]*", row["balance_wei"]) is not None,
-            "balance_wei must be a decimal wei string, not RPC hex or a Number; use BigInt(value).toString().",
+            "balance_wei must be a decimal wei string; use BigInt(value).toString().",
         )
         require(
             isinstance(row.get("balance_eth"), str)
             and re.fullmatch(r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?", row["balance_eth"]) is not None,
-            "balance_eth must be a formatted decimal string; use ethers.formatEther(balance), not Number arithmetic.",
+            "balance_eth must be a decimal string; use ethers.formatEther(balance).",
         )
         code = rpc("eth_getCode", [address, hex(block)])
         balance = rpc("eth_getBalance", [address, hex(block)])
@@ -260,11 +279,8 @@ def verify(root: Path) -> dict[str, Any]:
             content.replace("\r\n", "\n").strip() in saved_source.replace("\r\n", "\n")
             for content in contents
         ), "Saved Solidity must preserve the actual verified source and license notices, not placeholders.")
-        functions = set(re.findall(r"\bfunction\s+([A-Za-z_]\w*)\s*\(", saved_source))
-        require(address.lower() in summary.lower() and source["source_path"] in summary,
-                "Report must cite each selected address and its saved Solidity path.")
-        require(any(function in summary for function in functions), "Report cites no observed contract function.")
-        # Agent-writable source additions must not change the declaration checks.
+        require(source["source_path"] in summary, "Report must cite the saved Solidity path.")
+        # Parse the API source, not writable additions.
         report_functions = verify_report_section(summary, address, current["ContractName"], "\n".join(contents))
         verified.append({
             "address": address, "contract_name": current["ContractName"], "balance_wei": row["balance_wei"],
@@ -276,6 +292,8 @@ def verify(root: Path) -> dict[str, Any]:
 
 def main() -> int:
     try:
+        require(len(sys.argv) == 2, "Caller-provided current-command evidence is required.")
+        verify_commands(json.loads(Path(sys.argv[1]).read_text()))
         print(json.dumps(verify(Path.cwd()), indent=2))
         return 0
     except urllib.error.URLError as error:

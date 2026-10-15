@@ -301,6 +301,27 @@ def bootstrap_tools(root: Path, deadline: Deadline) -> None:
         raise JobError("Pinned Node installation did not report its expected version.")
 
 
+def agent_uid() -> int:
+    # A shared container UID can exhaust RLIMIT_NPROC through other containers.
+    ranges = []
+    for line in Path("/proc/self/uid_map").read_text().splitlines():
+        inside, _, count = map(int, line.split())
+        end = min(inside + count, 2 ** 31)
+        start = max(inside, 1_000_000 if end > 1_000_000 else 10_000 if end > 10_000 else 1)
+        if start < end:
+            ranges.append((start, end))
+    if not ranges:
+        raise JobError("The user namespace has no mapped non-root agent UID.")
+    start, end = max(ranges, key=lambda bounds: bounds[1] - bounds[0])
+    for _ in range(16):
+        candidate = start + uuid.uuid4().int % (end - start)
+        try:
+            pwd.getpwuid(candidate)
+        except KeyError:
+            return candidate
+    raise JobError("Could not allocate an unused mapped agent UID.")
+
+
 @dataclass
 class Sandbox:
     root: Path
@@ -333,15 +354,16 @@ class Sandbox:
         self.helper.parent.mkdir(mode=0o755)
         shutil.copyfile(self.root / "agent_tools.py", self.helper)
         self.helper.chmod(0o444)
+        uid = agent_uid()
         run_command(
-            ["useradd", "--system", "--user-group", "--no-create-home",
+            ["useradd", "--uid", str(uid), "--no-log-init", "--user-group", "--no-create-home",
              "--home-dir", str(self.home), "--shell", "/bin/false", username],
             deadline, context="Creating isolated agent identity",
         )
         identity = pwd.getpwnam(username)
         self.uid = identity.pw_uid
-        if self.uid <= 0 or identity.pw_gid <= 0:
-            raise JobError("Agent identity must not have root UID/GID.")
+        if self.uid != uid or self.uid <= 0 or identity.pw_gid <= 0:
+            raise JobError("Agent identity must use its allocated non-root UID/GID.")
         if inputs is not None:
             archive = self.root / "inputs.tar"
             if sha256_file(archive, deadline) != inputs.get("sha256"):
@@ -356,6 +378,14 @@ class Sandbox:
         probe = self.execute({"action": "list_files", "path": "."}, deadline)
         if "error" in probe:
             raise JobError("Agent isolation probe failed: " + str(probe["error"]))
+        native = self.execute({
+            "action": "run", "argv": ["node", "-e",
+                "Promise.all([require('fs').promises.readdir('.'),new Promise((ok,no)=>"
+                "require('dns').lookup('localhost',e=>e?no(e):ok()))])"
+                ".then(()=>console.log('agent-runtime-ok'))"],
+        }, deadline)
+        if not command_succeeded(native) or native.get("stdout") != "agent-runtime-ok\n":
+            raise JobError("Node async runtime probe failed under the agent limits: " + str(native))
 
     def stop_children(self) -> None:
         if self.uid <= 0:
@@ -385,6 +415,20 @@ class Sandbox:
             if time.monotonic() >= end:
                 raise JobError("Agent-owned processes could not be terminated.")
             time.sleep(0.05)
+
+    def verify(
+        self, code: str, commands: list[dict[str, Any]], deadline: Deadline,
+    ) -> dict[str, Any]:
+        context = self.helper.parent / "verification-context.json"
+        write_json(context, scrub_values(commands, self.secrets))
+        try:
+            context.chmod(0o444)
+            return self.execute({
+                "action": "run",
+                "argv": [str(Path(sys.executable).resolve()), "-I", "-S", "-c", code, str(context)],
+            }, deadline)
+        finally:
+            context.unlink()
 
     def execute(self, action: dict[str, Any], deadline: Deadline) -> dict[str, Any]:
         remaining = deadline.remaining()
@@ -513,13 +557,12 @@ def run_agent(
                 verification = None
                 try:
                     if options.verification_code is not None:
-                        verification = sandbox.execute({
-                            "action": "run",
-                            "argv": [
-                                str(Path(sys.executable).resolve()), "-I", "-S", "-c",
-                                options.verification_code,
-                            ],
-                        }, actions_deadline)
+                        commands = [
+                            {key: previous[key] for key in ("step", "action", "observation")}
+                            for previous in transcript["steps"][:-1]
+                            if previous.get("action", {}).get("action") == "run"
+                        ]
+                        verification = sandbox.verify(options.verification_code, commands, actions_deadline)
                         report["verification"] = verification
                         if not command_succeeded(verification):
                             raise JobError("Caller-provided task verification did not pass.")
