@@ -101,7 +101,11 @@ request signing keys, or use a live network for transaction execution.
      `/v2/api`. Never switch to the deprecated `/api` endpoint.
      Do not skip a failed contract, create placeholder Solidity, or substitute
      remembered contract behavior for downloaded source.
-   - Save the original response to `sources/<address>/etherscan.json`.
+   - Save the **complete original API response** to
+     `sources/<address>/etherscan.json`, including top-level `status`, `message`
+     and the `result` array. Use `JSON.stringify(etherscanJson, null, 2)`,
+     not `JSON.stringify(etherscanJson.result[0])`. Extract source fields from
+     `etherscanJson.result[0]`, but preserve the complete envelope as evidence.
      Save the verified source as `sources/<address>/contract.sol`, preserving
      its license notices. If the response is wrapped standard-input JSON,
      unwrap it and combine its source contents with original filename headers;

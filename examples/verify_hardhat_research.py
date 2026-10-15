@@ -221,8 +221,15 @@ def verify(root: Path) -> dict[str, Any]:
             "address": address, "apikey": os.environ["ETHERSCAN_API_KEY"],
         })
         fresh = request_json("https://api.etherscan.io/v2/api?" + query)
-        require(fresh.get("status") == saved_response.get("status") == "1",
-                "Etherscan V2 did not provide verified source. Keep /v2/api and include chainid=1.")
+        require(fresh.get("status") == "1",
+                "Fresh Etherscan V2 did not provide verified source. Keep /v2/api and include chainid=1.")
+        require(
+            isinstance(saved_response, dict) and saved_response.get("status") == "1"
+            and isinstance(saved_response.get("result"), list) and bool(saved_response["result"])
+            and isinstance(saved_response["result"][0], dict),
+            "Saved etherscan.json must contain the complete API response with status and result. "
+            "Save JSON.stringify(etherscanJson), not etherscanJson.result[0]; rerun the source script.",
+        )
         current = fresh["result"][0]
         stored = saved_response["result"][0]
         require(current["SourceCode"] == stored["SourceCode"] and bool(current["SourceCode"].strip()),

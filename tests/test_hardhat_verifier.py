@@ -110,6 +110,23 @@ class HardhatVerifierTests(unittest.TestCase):
         self.assertEqual({row["report_function_count"] for row in result["contracts"]}, {1})
         self.assertEqual(self.request.call_count, 7)
 
+    def test_flat_source_record_gets_actionable_saved_response_feedback(self):
+        path = self.root / self.contracts["contracts"][0]["etherscan_response_path"]
+        payload = json.loads(path.read_text())
+        path.write_text(json.dumps(payload["result"][0]))
+        with self.assertRaisesRegex(ValueError, "complete API response.*JSON.stringify.*rerun"):
+            verify(self.root)
+
+    def test_live_source_api_failure_is_not_reported_as_a_saved_file_error(self):
+        original = self.response
+
+        def unavailable(url, body=None):
+            return original(url, body) if body is not None else {"status": "0", "result": "NOTOK"}
+
+        with patch("examples.verify_hardhat_research.request_json", side_effect=unavailable):
+            with self.assertRaisesRegex(ValueError, "Fresh Etherscan V2"):
+                verify(self.root)
+
     def test_invented_owner_function_is_rejected_despite_correct_chain_and_source_data(self):
         report = self.root / "report.md"
         report.write_text(report.read_text().replace(
