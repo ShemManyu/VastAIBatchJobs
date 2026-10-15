@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 from job_utils import Deadline, DeadlineExceeded, JobError, LLAMA_COMMIT
 import remote_job
 from remote_job import (
-    bootstrap, download_model, gpu_details, infer, server_args,
+    bootstrap, cuda_architectures, download_model, gpu_details, infer, server_args,
     wait_for_gpu_offload, wait_for_server,
 )
 from tests.fakes import ANSWER, Clock, HF_TOKEN, VAST_TOKEN
@@ -189,6 +189,7 @@ class WorkerTests(WorkerFixture):
                 binary.write_text("SYNTHETIC_BINARY_FIXTURE")
 
         with patch("remote_job.gpu_details", return_value={"gpu_name": "A100", "gpu_vram_mib": 40536}), \
+             patch("remote_job.cuda_architectures", return_value="80") as architectures, \
              patch("remote_job.shutil.which", return_value="/fixture/tool"), \
              patch("remote_job.logged_command", side_effect=capture):
             result = bootstrap(self.root, {"gpu_name": "A100"}, Deadline(30))
@@ -197,9 +198,25 @@ class WorkerTests(WorkerFixture):
         self.assertTrue(any(LLAMA_COMMIT in args and "fetch" in args for args in commands))
         configure = next(args for args in commands if args[:2] == ["cmake", "-S"])
         self.assertIn("-DGGML_CUDA=ON", configure)
-        self.assertIn("-DCMAKE_CUDA_ARCHITECTURES=native", configure)
+        self.assertIn("-DCMAKE_CUDA_ARCHITECTURES=80", configure)
+        architectures.assert_called_once_with(1, unittest.mock.ANY)
         build = next(args for args in commands if args[:2] == ["cmake", "--build"])
         self.assertEqual(build[build.index("--target") + 1], "llama-server")
+
+    def test_cuda_build_architectures_use_every_actual_device_without_native(self):
+        with patch("remote_job.run_command", return_value=b"7.5\n8.0\n7.5\n10.0\n") as query:
+            self.assertEqual(cuda_architectures(4, Deadline(10)), "75;80;100")
+        self.assertIn("--query-gpu=compute_cap", query.call_args.args[0])
+        self.assertIn("--format=csv,noheader,nounits", query.call_args.args[0])
+
+    def test_invalid_or_partial_cuda_capabilities_fail_explicitly(self):
+        for output in (
+            b"", b"8.0\n", b"8.0\n8.0\n8.0\n", b"N/A\n8.0\n",
+            b"native\n8.0\n", b"75\n8.0\n", b"8.0;90\n8.0\n", b"8.12\n8.0\n",
+        ):
+            with self.subTest(output=output), patch("remote_job.run_command", return_value=output):
+                with self.assertRaises(JobError):
+                    cuda_architectures(2, Deadline(10))
 
     def test_template_without_cuda_toolkit_is_rejected_before_setup(self):
         with patch("remote_job.gpu_details", return_value={"gpu_name": "A100"}), \
@@ -220,6 +237,7 @@ class WorkerTests(WorkerFixture):
                 binary.write_text("SYNTHETIC_BINARY_FIXTURE")
 
         with patch("remote_job.gpu_details", return_value={"gpu_name": "A100"}), \
+             patch("remote_job.cuda_architectures", return_value="80"), \
              patch("remote_job.shutil.which", return_value="/fixture/tool"), \
              patch("remote_job.importlib.util.find_spec", return_value=None), \
              patch("remote_job.os.geteuid", return_value=0), \

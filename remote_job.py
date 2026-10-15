@@ -70,6 +70,23 @@ def gpu_details(expected: str, deadline: Deadline, expected_count: int = 1) -> d
     }
 
 
+def cuda_architectures(expected_count: int, deadline: Deadline) -> str:
+    positive_int(expected_count, "Expected GPU count")
+    output = run_command(
+        ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader,nounits"],
+        deadline, context="CUDA architecture verification",
+    ).decode("utf-8")
+    capabilities = [line.strip() for line in output.splitlines() if line.strip()]
+    if len(capabilities) != expected_count:
+        raise JobError("CUDA compute capabilities do not cover every allocated GPU.")
+    architectures = set()
+    for capability in capabilities:
+        if re.fullmatch(r"[1-9][0-9]*\.[0-9]", capability) is None:
+            raise JobError("Could not parse an allocated GPU's CUDA compute capability.")
+        architectures.add(capability.replace(".", ""))
+    return ";".join(sorted(architectures, key=int))
+
+
 def logged_command(args: list[str], root: Path, deadline: Deadline, context: str) -> None:
     log(root, context)
     with (root / "remote.log").open("ab") as file:
@@ -96,7 +113,8 @@ def bootstrap(root: Path, request: dict[str, Any], deadline: Deadline) -> dict[s
     expected_gpu = request.get("gpu_name")
     if not isinstance(expected_gpu, str):
         raise JobError("Expected GPU name is missing.")
-    gpu = gpu_details(expected_gpu, deadline, positive_int(request.get("gpu_count", 1), "GPU count"))
+    gpu_count = positive_int(request.get("gpu_count", 1), "GPU count")
+    gpu = gpu_details(expected_gpu, deadline, gpu_count)
     if shutil.which("nvcc") is None:
         raise JobError("The template must include the CUDA development toolkit (nvcc).")
     missing = [tool for tool in ("git", "cmake", "g++") if shutil.which(tool) is None]
@@ -141,9 +159,10 @@ def bootstrap(root: Path, request: dict[str, Any], deadline: Deadline) -> dict[s
     ):
         logged_command(args, root, deadline, context)
     build = source / "build"
+    architectures = cuda_architectures(gpu_count, deadline)
     logged_command(
         ["cmake", "-S", str(source), "-B", str(build), "-DGGML_CUDA=ON",
-         "-DCMAKE_CUDA_ARCHITECTURES=native", "-DCMAKE_BUILD_TYPE=Release",
+         f"-DCMAKE_CUDA_ARCHITECTURES={architectures}", "-DCMAKE_BUILD_TYPE=Release",
          "-DLLAMA_BUILD_TESTS=OFF", "-DLLAMA_BUILD_EXAMPLES=OFF",
          "-DLLAMA_BUILD_SERVER=ON", "-DLLAMA_BUILD_APP=OFF",
          "-DLLAMA_USE_PREBUILT_UI=OFF", "-DLLAMA_OPENSSL=OFF"],
