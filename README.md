@@ -139,6 +139,8 @@ python run_job.py --help
 
 Tests use fake cloud/SSH/downloader interfaces, temporary directories, fake clocks, and a local HTTP fixture. They never read your actual `.env`, rent a GPU, download real weights, or require CUDA. They cover teardown, uncertain allocation, cancellation, recovery isolation, artifact integrity, credential redaction, full GPU-offload evidence, and price/VRAM boundaries.
 
-Live read-only template, model metadata, offer pagination, and CLI dry-run checks have been exercised. A paid A100 run reached remote SSH, CUDA compilation, verified model download, and healthy server startup, but stopped before generation because default logging hid the required GPU-offload evidence. Teardown was confirmed. That logging mismatch is covered by a local regression.
+Live read-only template, model metadata, offer pagination, and CLI dry-run checks have been exercised. The default-verbosity failure from an earlier paid run is reproduced by a local regression.
 
-**Successful real GPU generation and retrieval have not yet been confirmed.** Local tests are not proof of a successful end-to-end GPU run, and another paid smoke test requires separate approval.
+**A real end-to-end A100 smoke test completed successfully on 2026-10-15 (UTC).** It used `bartowski/Meta-Llama-3.1-8B-Instruct-GGUF` / `Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf` on an A100-SXM4-40GB with the pinned template/runtime. All **33/33 layers** were offloaded to the GPU, and the exact response `GPU test successful.` was retrieved and verified locally with finish reason `stop`. Instance destruction was independently confirmed through the VastAI API. The run took approximately 12 minutes, including a fresh CUDA build, with A100-only selection, a USD 1/hour cap, a 30-minute deadline, 64 output tokens, and temperature 0.
+
+Further paid tests require separate approval. This result verifies the tested model/template/runtime/GPU combination, not every supported model or future marketplace offer.
