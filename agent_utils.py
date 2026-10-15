@@ -279,7 +279,10 @@ def extract_archive(
                     raise JobError("Workspace archive has unexpected, linked, or duplicate entries.")
                 seen.add(name)
                 path = destination / name
-                path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                parent = destination
+                for part in name.split("/")[:-1]:
+                    parent = parent / part
+                    parent.mkdir(exist_ok=True, mode=0o700)
                 source = bundle.extractfile(member)
                 if source is None:
                     raise JobError("Workspace archive file could not be read.")

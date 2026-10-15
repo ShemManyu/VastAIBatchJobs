@@ -26,18 +26,21 @@ class ArchiveTests(unittest.TestCase):
         self.destination.mkdir(mode=0o700)
 
     def test_snapshot_round_trip_preserves_bytes_hashes_and_private_permissions(self):
-        (self.workspace / "scripts").mkdir()
+        original_umask = os.umask(0)
+        self.addCleanup(os.umask, original_umask)
+        (self.workspace / "scripts/nested/deeper").mkdir(parents=True)
         data = "print('caf\u00e9')\n".encode()
-        (self.workspace / "scripts/job.py").write_bytes(data)
+        (self.workspace / "scripts/nested/deeper/job.py").write_bytes(data)
         (self.workspace / "empty").write_bytes(b"")
         info = pack_directory(self.workspace, self.archive, Deadline(10), maximum=len(data))
         self.assertEqual(info["manifest"]["total_bytes"], len(data))
         self.assertEqual(info["sha256"], hashlib.sha256(self.archive.read_bytes()).hexdigest())
         extract_archive(self.archive, self.destination, info["manifest"], Deadline(10), maximum=len(data))
-        self.assertEqual((self.destination / "scripts/job.py").read_bytes(), data)
+        self.assertEqual((self.destination / "scripts/nested/deeper/job.py").read_bytes(), data)
         self.assertEqual((self.destination / "empty").read_bytes(), b"")
-        self.assertEqual((self.destination / "scripts").stat().st_mode & 0o777, 0o700)
-        self.assertEqual((self.destination / "scripts/job.py").stat().st_mode & 0o777, 0o600)
+        for name in ("scripts", "scripts/nested", "scripts/nested/deeper"):
+            self.assertEqual((self.destination / name).stat().st_mode & 0o777, 0o700)
+        self.assertEqual((self.destination / "scripts/nested/deeper/job.py").stat().st_mode & 0o777, 0o600)
         self.assertEqual(self.archive.stat().st_mode & 0o777, 0o600)
         with self.assertRaises(JobError):
             pack_directory(self.workspace, self.root / "too-small.tar", Deadline(10), maximum=len(data) - 1)
