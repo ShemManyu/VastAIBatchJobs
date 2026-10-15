@@ -90,6 +90,27 @@ class WorkflowTests(unittest.TestCase):
         for path in state.output.iterdir():
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
+    def test_multi_gpu_count_is_revalidated_persisted_and_sent_to_both_worker_stages(self):
+        client = FakeClient()
+        client.offer = replace(client.offer, gpu_count=8)
+        with patch.object(client, "offers", wraps=client.offers) as search:
+            state = self.execute(client, settings=replace(self.settings, gpu_count=8))
+        self.assertEqual([call.kwargs["gpu_count"] for call in search.call_args_list], [8, 8])
+        self.assertEqual(state.data["settings"]["gpu_count"], 8)
+        self.assertEqual(state.data["offer"]["gpu_count"], 8)
+        self.assertEqual([payload["gpu_count"] for _, payload in self.transports[-1].requests], [8, 8])
+        self.assertFalse(client.exists)
+
+    def test_changed_gpu_count_or_insufficient_aggregate_weights_capacity_cannot_be_rented(self):
+        from run_job import select_offer
+
+        client = FakeClient()
+        with self.assertRaises(JobError):
+            self.execute(client, settings=replace(self.settings, gpu_count=8))
+        self.assertEqual(client.created, 0)
+        with self.assertRaises(JobError):
+            select_offer(self.settings, [client.offer], model_size_bytes=50_000_000_000)
+
     def test_credentials_stay_out_of_artifacts_and_vast_key_stays_local(self):
         state = self.execute()
         payloads = self.transports[-1].requests
@@ -547,6 +568,47 @@ class ConfigAndTransportTests(unittest.TestCase):
         self.assertEqual(head.call_args.kwargs["token"], HF_TOKEN)
         self.assertIn("/resolve/" + "a" * 40 + "/", head.call_args.args[0])
         download.assert_not_called()
+
+    def test_complete_split_set_checks_every_file_at_one_revision_and_sums_all_sizes(self):
+        names = [f"Q3/model-0000{index}-of-00003.gguf" for index in (1, 2, 3)]
+        settings = Settings("unit/model", names[0], "test", Credentials(VAST_TOKEN, HF_TOKEN),
+                            Path("/unused/output"), Path("/unused/state"))
+        metadata = [SimpleNamespace(commit_hash="a" * 40, size=index * 16, etag=str(index) * 64)
+                    for index in (1, 2, 3)]
+        with patch("huggingface_hub.HfApi") as api, \
+             patch("huggingface_hub.get_hf_file_metadata", side_effect=metadata) as head, \
+             patch("huggingface_hub.hf_hub_download") as download:
+            api.return_value.model_info.return_value = SimpleNamespace(
+                sha="a" * 40, siblings=[SimpleNamespace(rfilename=name) for name in names],
+            )
+            result = inspect_model(settings, Clock().deadline(30))
+        self.assertEqual(result["size_bytes"], 96)
+        self.assertIsNone(result["sha256"])
+        self.assertEqual([item["filename"] for item in result["files"]], names)
+        self.assertEqual([item["sha256"] for item in result["files"]], [str(index) * 64 for index in (1, 2, 3)])
+        self.assertEqual(head.call_count, 3)
+        self.assertTrue(all("/resolve/" + "a" * 40 + "/" in call.args[0] for call in head.call_args_list))
+        download.assert_not_called()
+
+    def test_missing_split_member_or_mismatched_member_revision_fails_without_download(self):
+        names = [f"model-0000{index}-of-00002.gguf" for index in (1, 2)]
+        settings = Settings("unit/model", names[0], "test", Credentials(VAST_TOKEN, HF_TOKEN),
+                            Path("/unused/output"), Path("/unused/state"))
+        with patch("huggingface_hub.HfApi") as api, \
+             patch("huggingface_hub.get_hf_file_metadata") as head:
+            api.return_value.model_info.return_value = SimpleNamespace(
+                sha="a" * 40, siblings=[SimpleNamespace(rfilename=names[0])],
+            )
+            with self.assertRaises(JobError):
+                inspect_model(settings, Clock().deadline(30))
+            head.assert_not_called()
+            api.return_value.model_info.return_value.siblings.append(SimpleNamespace(rfilename=names[1]))
+            head.side_effect = [
+                SimpleNamespace(commit_hash="a" * 40, size=16, etag="b" * 64),
+                SimpleNamespace(commit_hash="c" * 40, size=16, etag="b" * 64),
+            ]
+            with self.assertRaises(JobError):
+                inspect_model(settings, Clock().deadline(30))
 
     def test_file_access_failure_is_explicit_and_sanitized(self):
         settings = Settings("unit/model", "model.gguf", "test", Credentials(VAST_TOKEN, HF_TOKEN),

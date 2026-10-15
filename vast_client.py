@@ -47,6 +47,7 @@ class Offer:
     direct_ports: int
     download_cost_per_gb: float
     upload_cost_per_gb: float
+    gpu_count: int = 1
 
     @property
     def a100(self) -> bool:
@@ -57,6 +58,8 @@ class Offer:
             "offer_id": self.id,
             "gpu_name": self.gpu_name,
             "gpu_ram_mb": self.gpu_ram_mb,
+            "gpu_count": self.gpu_count,
+            "total_gpu_ram_mb": self.gpu_ram_mb * self.gpu_count,
             "hourly_price_usd": self.hourly_price,
             "download_cost_per_gb_usd": self.download_cost_per_gb,
             "upload_cost_per_gb_usd": self.upload_cost_per_gb,
@@ -246,11 +249,12 @@ class VastClient:
     def offers(
         self, template: Template, disk_gb: int, max_price: float,
         rental_seconds: float, deadline: Deadline, *, offer_id: int | None = None,
+        gpu_count: int = 1,
     ) -> list[Offer]:
         maximum_compute = 1200 if template.cuda_version >= 12.8 else 900
         filters = merge_filters(template.filters, {
             "verified": {"eq": True}, "rentable": {"eq": True}, "rented": {"eq": False},
-            "num_gpus": {"eq": 1}, "gpu_arch": {"eq": "nvidia"},
+            "num_gpus": {"eq": positive_int(gpu_count, "GPU count")}, "gpu_arch": {"eq": "nvidia"},
             "gpu_ram": {"gte": MIN_GPU_RAM_MB}, "disk_space": {"gte": disk_gb},
             "cpu_arch": {"eq": "amd64"}, "cpu_ram": {"gte": 16_000},
             "compute_cap": {"gte": 750, "lte": maximum_compute},
@@ -294,6 +298,7 @@ class VastClient:
                     number(row["dph_total"], "Hourly price"), int(direct_ports),
                     number(row["inet_down_cost"], "Download bandwidth price"),
                     number(row["inet_up_cost"], "Upload bandwidth price"),
+                    positive_int(row["num_gpus"], "Offer GPU count"),
                 ))
             truncated = data.get("truncated")
             if truncated is not None and not isinstance(truncated, bool):

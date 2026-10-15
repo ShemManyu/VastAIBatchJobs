@@ -107,6 +107,18 @@ class ApiTests(unittest.TestCase):
         self.assertNotIn("id", query)
         self.assertEqual([offer.id for offer in offers], [9])
 
+    def test_multi_gpu_filter_uses_exact_count_and_per_gpu_memory(self):
+        client, session = self.client(Response({"offers": [
+            raw_offer(1, num_gpus=4, dph_total=3),
+            raw_offer(2, num_gpus=8, dph_total=7.5),
+        ]}))
+        offers = client.offers(TEMPLATE, 64, 8, 11100, Deadline(10), gpu_count=8)
+        self.assertEqual(session.calls[0][2]["json"]["num_gpus"], {"eq": 8})
+        self.assertEqual([offer.id for offer in offers], [2])
+        self.assertEqual(offers[0].gpu_count, 8)
+        self.assertEqual(offers[0].gpu_ram_mb, 40960)
+        self.assertEqual(offers[0].summary()["total_gpu_ram_mb"], 327680)
+
     def test_server_filter_violation_does_not_rent_an_ineligible_gpu(self):
         cases = (
             {"gpu_ram": 23999}, {"dph_total": 4.0001}, {"num_gpus": 2},

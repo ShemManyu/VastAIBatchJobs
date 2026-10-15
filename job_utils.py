@@ -108,7 +108,7 @@ def positive_int(value: object, context: str) -> int:
     return value
 
 
-def model_filename(value: object) -> str:
+def model_filename(value: object, *, allow_split: bool = False) -> str:
     if not isinstance(value, str) or not value or "\\" in value:
         raise JobError("Model filename must be a relative Hugging Face GGUF path.")
     if any(part in ("", ".", "..") for part in value.split("/")):
@@ -116,13 +116,26 @@ def model_filename(value: object) -> str:
     basename = value.rsplit("/", 1)[-1].lower()
     if not basename.endswith(".gguf"):
         raise JobError("Select an exact .gguf filename.")
-    if re.search(r"-\d+-of-\d+\.gguf$", basename):
+    if not allow_split and re.search(r"-\d+-of-\d+\.gguf$", basename):
         raise JobError("Split GGUF files are not supported; select a standalone model.")
     if re.match(r"^(mmproj|mtp|vocab|adapter|lora)([-_.]|$)", basename) or re.search(
         r"[-_.]lora\.gguf$", basename
     ):
         raise JobError("Select a standalone text model, not a sidecar or adapter.")
     return value
+
+
+def model_filenames(value: object) -> list[str]:
+    filename = model_filename(value, allow_split=True)
+    match = re.fullmatch(r"(.+)-(\d{5})-of-(\d{5})(\.gguf)", filename, re.IGNORECASE)
+    if match is None:
+        if re.search(r"-\d+-of-\d+\.gguf$", filename, re.IGNORECASE):
+            raise JobError("Split GGUF filenames must use five-digit shard indices.")
+        return [filename]
+    first, count = int(match[2]), int(match[3])
+    if first != 1 or not 2 <= count <= 128:
+        raise JobError("Select shard 00001 from a complete GGUF set of 2 to 128 shards.")
+    return [f"{match[1]}-{index:05d}-of-{count:05d}{match[4]}" for index in range(1, count + 1)]
 
 
 def commit_sha(value: object) -> str:

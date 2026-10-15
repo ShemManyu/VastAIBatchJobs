@@ -26,7 +26,7 @@ from agent_utils import (
 )
 from job_utils import (
     Deadline, DeadlineExceeded, JobError, LLAMA_COMMIT, LLAMA_RELEASE, MAX_WORKER_REQUEST_BYTES, atomic_write,
-    commit_sha, completion_text, error_text, model_filename, number, object_value,
+    commit_sha, completion_text, error_text, model_filenames, number, object_value,
     positive_int, read_json, redact, run_command, sha256_file, write_json,
 )
 from vast_client import (
@@ -83,11 +83,13 @@ class Settings:
     agent: AgentOptions | None = None
     max_bandwidth_price: float | None = None
     offer_id: int | None = None
+    gpu_count: int = 1
 
     def validate(self) -> None:
         if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", self.model_repo):
             raise JobError("Model repository must be a Hugging Face owner/repository ID.")
-        model_filename(self.model_file)
+        model_filenames(self.model_file)
+        positive_int(self.gpu_count, "GPU count")
         if not self.model_revision.strip():
             raise JobError("Model revision must not be empty.")
         if not self.prompt.strip() or len(self.prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
@@ -176,24 +178,36 @@ def inspect_model(settings: Settings, deadline: Deadline) -> dict[str, Any]:
             settings.model_repo, revision=settings.model_revision, timeout=deadline.timeout(),
         )
         revision = commit_sha(info.sha)
-        metadata = get_hf_file_metadata(
-            hf_hub_url(settings.model_repo, settings.model_file, revision=revision),
-            token=settings.credentials.hugging_face, timeout=deadline.timeout(),
-        )
-        if commit_sha(metadata.commit_hash) != revision:
-            raise JobError("Hugging Face returned a different file revision than requested.")
-        size = positive_int(metadata.size, "GGUF file size")
+        names = model_filenames(settings.model_file)
+        if len(names) > 1:
+            available = {item.rfilename for item in info.siblings}
+            if not set(names) <= available:
+                raise JobError("The selected split GGUF set is incomplete in the resolved repository revision.")
+        files = []
+        for name in names:
+            metadata = get_hf_file_metadata(
+                hf_hub_url(settings.model_repo, name, revision=revision),
+                token=settings.credentials.hugging_face, timeout=deadline.timeout(),
+            )
+            if commit_sha(metadata.commit_hash) != revision:
+                raise JobError("Hugging Face returned a different file revision than requested.")
+            size = positive_int(metadata.size, "GGUF file size")
+            etag = metadata.etag
+            digest = etag if isinstance(etag, str) and re.fullmatch(r"[a-f0-9]{64}", etag) else None
+            if len(names) > 1 and digest is None:
+                raise JobError("Each split GGUF shard must provide authenticated SHA-256 metadata.")
+            files.append({"filename": name, "size_bytes": size, "sha256": digest})
     except (OSError, ValueError, RuntimeError) as error:
         raise JobError(
             "Hugging Face file access failed. Check the token, filename, and model license: "
             + error_text(error, settings.credentials.secrets)
         ) from error
-    etag = metadata.etag
-    sha256 = etag if isinstance(etag, str) and re.fullmatch(r"[a-f0-9]{64}", etag) else None
     deadline.remaining()
     return {
         "repo": settings.model_repo, "filename": settings.model_file,
-        "revision": revision, "size_bytes": size, "sha256": sha256,
+        "revision": revision, "size_bytes": sum(item["size_bytes"] for item in files),
+        "sha256": files[0]["sha256"] if len(files) == 1 else None,
+        **({"files": files} if len(files) > 1 else {}),
     }
 
 
@@ -212,11 +226,13 @@ def preflight(
     offers = client.offers(
         template, settings.disk_gb, settings.max_hourly_price,
         settings.timeout_minutes * 60 + CLEANUP_SECONDS, deadline, offer_id=settings.offer_id,
+        gpu_count=settings.gpu_count,
     )
-    return model, template, select_offer(settings, offers)
+    return model, template, select_offer(settings, offers, model_size_bytes=model["size_bytes"])
 
 
-def select_offer(settings: Settings, offers: list[Offer]) -> Offer:
+def select_offer(settings: Settings, offers: list[Offer], *, model_size_bytes: int = 0) -> Offer:
+    offers = [offer for offer in offers if offer.gpu_count == settings.gpu_count]
     if settings.offer_id is not None:
         offers = [offer for offer in offers if offer.id == settings.offer_id]
         if not offers:
@@ -230,6 +246,12 @@ def select_offer(settings: Settings, offers: list[Offer]) -> Offer:
             raise JobError(
                 f"No offers meet the USD {settings.max_bandwidth_price:g}/GB bandwidth cap."
             )
+    offers = [
+        offer for offer in offers
+        if offer.gpu_ram_mb * offer.gpu_count * 1_000_000 >= model_size_bytes
+    ]
+    if not offers:
+        raise JobError("No eligible offer has enough aggregate GPU memory for the model weights.")
     return choose_offer(offers, settings.gpu_policy, settings.max_hourly_price)
 
 
@@ -244,6 +266,7 @@ def preview(settings: Settings, model: dict[str, Any], template: Template, offer
         "limits": {
             "max_hourly_price_usd": settings.max_hourly_price,
             "requested_offer_id": settings.offer_id,
+            "gpu_count": settings.gpu_count,
             "timeout_minutes": settings.timeout_minutes,
             "cleanup_seconds": CLEANUP_SECONDS, "disk_gb": settings.disk_gb,
             "context_size": settings.context_size, "max_tokens": settings.max_tokens,
@@ -765,6 +788,7 @@ def run_workflow(
         "settings": {
             "max_hourly_price_usd": settings.max_hourly_price,
             "requested_offer_id": settings.offer_id,
+            "gpu_count": settings.gpu_count,
             "timeout_minutes": settings.timeout_minutes, "gpu_policy": settings.gpu_policy,
             "disk_gb": settings.disk_gb, "context_size": settings.context_size,
             "max_tokens": settings.max_tokens, "temperature": settings.temperature,
@@ -800,8 +824,9 @@ def run_workflow(
         refreshed = client.offers(
             template, settings.disk_gb, settings.max_hourly_price,
             deadline.remaining() + CLEANUP_SECONDS, deadline, offer_id=offer.id,
+            gpu_count=settings.gpu_count,
         )
-        offer = select_offer(settings, refreshed)
+        offer = select_offer(settings, refreshed, model_size_bytes=model["size_bytes"])
         state.data["offer"] = offer.summary()
         state.data["creation_outcome"] = "unknown"
         state.data["creation_started_at"] = datetime.now(timezone.utc).isoformat()
@@ -828,13 +853,15 @@ def run_workflow(
         if settings.agent is not None:
             transport.upload_agent(state.directory / "inputs.tar" if input_bundle is not None else None, deadline)
         transport.invoke("bootstrap", {
-            "gpu_name": offer.gpu_name, **({"agent": True} if settings.agent is not None else {}),
+            "gpu_name": offer.gpu_name, "gpu_count": settings.gpu_count,
+            **({"agent": True} if settings.agent is not None else {}),
         }, deadline)
         state.log("Downloading the GGUF and running the agent remotely." if settings.agent is not None
                   else "Downloading the GGUF and generating the response remotely.")
         request = {
             "model": model, "hf_token": settings.credentials.hugging_face,
             "prompt": settings.prompt, "gpu_name": offer.gpu_name,
+            "gpu_count": settings.gpu_count,
             "context_size": settings.context_size, "max_tokens": settings.max_tokens,
             "temperature": settings.temperature,
         }
@@ -942,7 +969,7 @@ def parser_for_cli() -> argparse.ArgumentParser:
         run = commands.add_parser(name, help="Rent, infer, retrieve, and destroy." if name == "run"
                                   else "Run remote actions, retrieve artifacts, and destroy.")
         run.add_argument("--model-repo", required=True, help="Hugging Face owner/repository.")
-        run.add_argument("--model-file", required=True, help="Exact standalone GGUF filename.")
+        run.add_argument("--model-file", required=True, help="Standalone GGUF or shard 00001 of a complete split set.")
         prompt = run.add_mutually_exclusive_group(required=True)
         prompt.add_argument("--prompt", help="Prompt text; use quotes to preserve shell characters.")
         prompt.add_argument("--prompt-file", type=Path, help="UTF-8 task/prompt file, including Markdown.")
@@ -957,6 +984,7 @@ def parser_for_cli() -> argparse.ArgumentParser:
                          help="Optional advertised USD/GB cap for both ingress and egress.")
         run.add_argument("--timeout-minutes", type=float, default=180)
         run.add_argument("--gpu-policy", choices=("prefer-a100", "a100-only"), default="prefer-a100")
+        run.add_argument("--gpu-count", type=int, default=1, help="Exact number of GPUs in one rented instance.")
         run.add_argument("--disk-gb", type=int, default=64)
         run.add_argument("--context-size", type=int, default=4096 if name == "run" else 16384)
         run.add_argument("--max-tokens", type=int, default=1024 if name == "run" else 2048)
@@ -1040,6 +1068,7 @@ def main(argv: list[str] | None = None) -> int:
             agent_options,
             args.max_bandwidth_price,
             args.offer_id,
+            args.gpu_count,
         )
         settings.validate()
         if args.dry_run:

@@ -56,16 +56,18 @@ For a longer or sensitive prompt, create a UTF-8 file and use `--prompt-file ./r
 
 ```bash
 python run_job.py agent \
-  --model-repo bartowski/Qwen2.5-Coder-32B-Instruct-GGUF \
-  --model-file Qwen2.5-Coder-32B-Instruct-Q4_K_M.gguf \
+  --model-repo unsloth/Qwen3-Coder-480B-A35B-Instruct-GGUF \
+  --model-file Q3_K_S/Qwen3-Coder-480B-A35B-Instruct-Q3_K_S-00001-of-00005.gguf \
   --prompt-file ./examples/hardhat-research.md \
   --verify-script ./examples/verify_hardhat_research.py \
   --agent-env ALCHEMY_API_KEY \
   --agent-env ETHERSCAN_API_KEY \
   --gpu-policy a100-only \
-  --max-hourly-price 1 \
-  --max-bandwidth-price 0.01 \
-  --timeout-minutes 45 \
+  --gpu-count 8 \
+  --max-hourly-price 7.52 \
+  --max-bandwidth-price 0.015625 \
+  --timeout-minutes 43 \
+  --disk-gb 400 \
   --context-size 65536 \
   --max-steps 40 \
   --max-tokens 4096
@@ -73,9 +75,11 @@ python run_job.py agent \
 
 This is a paid run. Add `--dry-run` to inspect the model/template/offer without executing actions or renting an instance. The supplied [Hardhat task](examples/hardhat-research.md) instructs the agent to create and execute its own scripts on a local Ethereum mainnet fork, read native ETH balances for two randomly sampled verified contracts, fetch deployed bytecode through Alchemy, obtain verified Solidity through Etherscan, and write a source-grounded report. **Alchemy `eth_getCode` returns bytecode, not verified Solidity.** No transactions, deployment, or wallet credentials are needed.
 
-The agent example uses a dense 32B coding model with an approximately 19.9 GB Q4 download. Prefer an 80 GB A100 for the larger context. Earlier 8B and 30B/3B-active MoE attempts did not complete this scenario reliably: they guessed dependencies, omitted required configuration, or made unsupported report claims. Model completion is not a correctness guarantee; inspect the returned execution and source evidence.
+The larger agent example uses Qwen3-Coder-480B-A35B, a 480B-total/35B-active mixture-of-experts model, with approximately 207 GB of Q3_K_S GGUF weights across five files. It requires a multi-GPU instance such as eight 40 GB A100s. Active parameters do not reduce the memory needed to fully offload all model weights. This lower-precision choice reduces download cost versus its approximately 290 GB Q4_K_M set, but model size and quantization do not guarantee reasoning accuracy. Earlier 8B, 30B/3B-active MoE, and 32B coder attempts did not complete this scenario reliably; inspect actual execution and source evidence.
 
-The research example uses a 65,536-token context because retained script/tool/source history exceeded 32,768 tokens in a real attempt. It reserves 4,096 output tokens per decision so the source-evidence report tables fit. The workflow fails explicitly instead of silently discarding evidence when history plus reserved output exceeds the limit. Keep metadata output compact, avoid dumping bytecode/ABI, and choose context capacity supported by both the model and GPU.
+At an observed eight-A100 quote of $7.5126/hour and $0.015625/GB ingress, the Q3_K_S weights cost approximately $3.23 to download. The 43-minute job deadline plus five-minute cleanup costs approximately $6.01 at that hourly quote, before other traffic and billing updates. This is a cost estimate, not an invoice guarantee; recheck the dry-run quote and obtain approval before renting.
+
+The research example uses a 65,536-token context because retained script/tool/source history exceeded 32,768 tokens in a real attempt. It reserves 4,096 output tokens per decision so the source-evidence report tables fit. The pinned server caps usable slots to the GGUF's training context even if `--context-size` requests more; the worker checks `/props` after startup and fails before generation if the actual single-slot capacity is smaller. Increasing the allocation alone did not extend the tested Qwen2.5-Coder model's 32,768-token limit. The workflow also fails explicitly instead of silently discarding evidence when history plus reserved output exceeds the verified limit. Keep metadata output compact, avoid dumping bytecode/ABI, and choose context capacity supported by both the model and GPU.
 
 Add `ALCHEMY_API_KEY` and `ETHERSCAN_API_KEY` to the selected `.env` for this example. Each `--agent-env NAME` forwards only that named variable to command processes over SSH stdin. Process-environment precedence is unchanged. Missing/empty selected variables fail before rental. The VastAI/Hugging Face credentials and identity/interpreter variables cannot be forwarded this way. Values are not included in model messages or metadata.
 
@@ -94,6 +98,10 @@ Available actions are `run` with an argv array, `read_file`, `write_file`, `list
 | `--temperature` | `0` | Agent generation temperature |
 
 Other instance/model/output defaults match `run`. Input snapshots are limited to 64 MiB and 5,000 files. Symlinks, hardlinks, special files, common credential paths, and dependency directories are refused. Known credential values are checked before upload; this cannot detect every possible secret, so review selected input files yourself. Relative `--input-dir` paths resolve against the caller's current directory.
+
+`--gpu-count` selects exactly that many GPUs in one instance and is revalidated before rental. Per-GPU VRAM is not aggregate VRAM; offers must have at least 24 GB per GPU and enough combined memory for the weight files. Context/cache and runtime allocations require additional headroom. Every exposed device is checked against the selected GPU family and count. The server retains one inference slot and full layer offload across the available devices.
+
+For split GGUFs, select shard `00001` with `--model-file`. Preflight derives the complete ordered set, checks every file at the same resolved revision, and requires each shard's authenticated size/SHA-256. Disk/download estimates use the whole set. The worker downloads and verifies every shard in the same directory before starting llama.cpp with the first file. Non-first, malformed, incomplete, or mixed-revision sets fail explicitly; standalone GGUF behavior is unchanged.
 
 `--verify-script` snapshots a trusted, nonempty standard-library Python script of at most 16 KiB before rental, matching the tool's per-argument byte limit. It runs remotely in the workspace with the same non-root identity, approved task variables, and tool limits whenever the model requests `finish`. A nonzero exit, timeout, or tool error rejects finish and returns the observation to the model for correction. The immutable script text is sent through SSH stdin, not copied into the agent-writable workspace or exposed as a local process argument; metadata records its SHA-256. It is not executed on your Mac. Relative paths resolve against the caller's directory.
 
@@ -138,6 +146,7 @@ Credential-bearing files or unsafe/oversized archives are refused rather than si
 | `--max-hourly-price` | `4.00` | Advertised USD/hour cap, including the requested storage |
 | `--max-bandwidth-price` | None | Optional advertised USD/GB cap for both ingress and egress, rechecked before creation |
 | `--timeout-minutes` | `180` | Job deadline covering preflight through response retrieval |
+| `--gpu-count` | `1` | Exact GPUs in one instance; every GPU needs at least 24 GB VRAM |
 | `--disk-gb` | `64` | Instance disk allocation |
 | `--context-size` | `4096` | Total model context, including input and output |
 | `--max-tokens` | `1024` | Output token limit, strictly below context size |
@@ -147,7 +156,7 @@ Credential-bearing files or unsafe/oversized archives are refused rather than si
 
 The default template is pinned to `pytorch/pytorch:2.4.0-cuda12.4-cudnn9-devel`. A changed default image is rejected rather than silently trusted. Overrides must provide Python 3.10+, CUDA development tools, build tools (or root/`apt-get` to install missing ones), and noninteractive root SSH access.
 
-Offer selection requires one NVIDIA GPU with at least **24,000 MB per-GPU VRAM** according to VastAI's API units, an AMD64 host, at least 16,000 MB system RAM, sufficient disk/rental duration, verified/rentable status, and reliability of at least 0.98. Template hardware filters also apply. The default CUDA 12.4 image admits compute capabilities 7.5 through 9.0, excluding newer Blackwell GPUs; CUDA 12.8+ overrides admit capabilities through 12.0.
+Offer selection requires exactly `--gpu-count` NVIDIA GPUs, each with at least **24,000 MB per-GPU VRAM** according to VastAI's API units, an AMD64 host, at least 16,000 MB system RAM, sufficient disk/rental duration, verified/rentable status, and reliability of at least 0.98. Combined advertised VRAM must cover the weight files, with additional headroom needed for context/runtime memory. Template hardware filters also apply. The default CUDA 12.4 image admits compute capabilities 7.5 through 9.0, excluding newer Blackwell GPUs; CUDA 12.8+ overrides admit capabilities through 12.0.
 
 An eligible A100 wins over a cheaper non-A100. Within the preference tier, the lowest hourly price wins. Searches follow full result pages rather than assuming the first mixed-GPU page contains all available A100s.
 
@@ -206,7 +215,7 @@ The Hugging Face token, job request, and any explicitly selected agent task vari
 
 Credential values and URL query strings are redacted from collected diagnostics. Local result/state directories are private, and final artifact files use mode `0600`. `.env`, `.venv`, `.vastai-runs`, and default `modeloutput` are ignored by Git. If you choose another output path inside the repository, ignore it separately; do not commit sensitive prompt files or generated results.
 
-Both modes are synchronous, one-task-per-instance workflows, not training, interactive sessions, or persistent endpoints. `run` produces one response; `agent` can perform bounded multi-step actions. Use a standalone text GGUF supported by the pinned runtime. Split GGUFs, multimodal sidecars, and adapters are unsupported; common filename patterns are rejected before rental. Differently named unsupported architectures or files fail explicitly during remote loading. CPU fallback and partial GPU-layer offload are not accepted as successful GPU execution.
+Both modes are synchronous, one-task-per-instance workflows, not training, interactive sessions, or persistent endpoints. `run` produces one response; `agent` can perform bounded multi-step actions. Use a supported standalone text GGUF or the first shard of a complete split set. Multimodal sidecars and adapters remain unsupported; common filename patterns are rejected before rental. Differently named unsupported architectures or files fail explicitly during remote loading. CPU fallback and partial GPU-layer offload are not accepted as successful GPU execution.
 
 The worker sets server verbosity to `4`: the pinned runtime hides its model-loader and GPU-offload diagnostics at the default level `3`. After healthy startup, it waits briefly for the asynchronous logger to report nonzero full layer offload from this server, not an earlier log entry. Missing, zero, or partial offload still fails before generation and triggers teardown.
 

@@ -87,7 +87,7 @@ class AgentWorkflowTests(unittest.TestCase):
         state = self.run_workflow()
         bootstrap, agent = self.transports[-1].requests
         self.assertEqual(bootstrap[0], "bootstrap")
-        self.assertEqual(bootstrap[1], {"gpu_name": "A100 SXM4", "agent": True})
+        self.assertEqual(bootstrap[1], {"gpu_name": "A100 SXM4", "gpu_count": 1, "agent": True})
         self.assertEqual(agent[0], "agent")
         self.assertEqual(agent[1]["task_env"], {"ALCHEMY_API_KEY": TASK_KEY})
         self.assertEqual(agent[1]["hf_token"], HF_TOKEN)
@@ -114,8 +114,9 @@ class AgentWorkflowTests(unittest.TestCase):
         client.offer = replace(client.offer, download_cost_per_gb=0.01, upload_cost_per_gb=0.01)
         original = client.offers
 
-        def changed(template, disk_gb, max_price, rental_seconds, deadline, *, offer_id=None):
-            rows = original(template, disk_gb, max_price, rental_seconds, deadline, offer_id=offer_id)
+        def changed(template, disk_gb, max_price, rental_seconds, deadline, *, offer_id=None, gpu_count=1):
+            rows = original(template, disk_gb, max_price, rental_seconds, deadline,
+                            offer_id=offer_id, gpu_count=gpu_count)
             return [replace(row, download_cost_per_gb=0.010001) for row in rows] if offer_id else rows
 
         with patch.object(client, "offers", side_effect=changed), self.assertRaises(JobError):

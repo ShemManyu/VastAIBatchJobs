@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any, Iterator
 
 from job_utils import (
     Deadline, DeadlineExceeded, JobError, LLAMA_COMMIT, MAX_WORKER_REQUEST_BYTES, atomic_write,
-    commit_sha, completion_text, error_text, model_filename, number,
+    commit_sha, completion_text, error_text, model_filenames, number,
     object_value, positive_int, redact, run_command, sha256_file,
     stop_process, write_json,
 )
@@ -31,30 +31,41 @@ def log(root: Path, message: str, token: str = "") -> None:
         file.write(redact(message, (token,)) + "\n")
 
 
-def gpu_details(expected: str, deadline: Deadline) -> dict[str, Any]:
+def gpu_details(expected: str, deadline: Deadline, expected_count: int = 1) -> dict[str, Any]:
+    positive_int(expected_count, "Expected GPU count")
     output = run_command(
         ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
         deadline, context="GPU verification",
     ).decode("utf-8")
     rows = [line.strip() for line in output.splitlines() if line.strip()]
-    if len(rows) != 1:
-        raise JobError("The instance must expose exactly one NVIDIA GPU.")
-    try:
-        name, memory = rows[0].rsplit(",", 1)
-        memory_mib = number(float(memory.strip()), "GPU memory", positive=True)
-    except ValueError as error:
-        raise JobError("Could not parse nvidia-smi GPU details.") from error
-    if not 24_000 <= memory_mib:
-        raise JobError("The remote GPU has less than the required 24 GB VRAM.")
+    if len(rows) != expected_count:
+        raise JobError(f"The instance must expose exactly {expected_count} NVIDIA GPU(s).")
 
     def canonical(value: str) -> str:
         value = re.sub(r"\b(nvidia|geforce|tesla)\b", "", value, flags=re.IGNORECASE)
         value = re.sub(r"[-_ ]\d+gb(?:\b|_)", "", value, flags=re.IGNORECASE)
         return re.sub(r"[^a-z0-9]", "", value.lower())
 
-    if canonical(expected) not in canonical(name) or not canonical(expected):
-        raise JobError("The instance GPU does not match the selected offer.")
-    return {"gpu_name": name.strip(), "gpu_vram_mib": memory_mib}
+    devices = []
+    for row in rows:
+        try:
+            name, memory = row.rsplit(",", 1)
+            memory_mib = number(float(memory.strip()), "GPU memory", positive=True)
+        except ValueError as error:
+            raise JobError("Could not parse nvidia-smi GPU details.") from error
+        if memory_mib < 24_000:
+            raise JobError("A remote GPU has less than the required 24 GB VRAM.")
+        if canonical(expected) not in canonical(name) or not canonical(expected):
+            raise JobError("An instance GPU does not match the selected offer.")
+        devices.append({"gpu_name": name.strip(), "gpu_vram_mib": memory_mib})
+    return {
+        **devices[0],
+        **({
+            "gpu_count": expected_count,
+            "gpu_vram_total_mib": sum(item["gpu_vram_mib"] for item in devices),
+            "gpus": devices,
+        } if expected_count > 1 else {}),
+    }
 
 
 def logged_command(args: list[str], root: Path, deadline: Deadline, context: str) -> None:
@@ -83,7 +94,7 @@ def bootstrap(root: Path, request: dict[str, Any], deadline: Deadline) -> dict[s
     expected_gpu = request.get("gpu_name")
     if not isinstance(expected_gpu, str):
         raise JobError("Expected GPU name is missing.")
-    gpu = gpu_details(expected_gpu, deadline)
+    gpu = gpu_details(expected_gpu, deadline, positive_int(request.get("gpu_count", 1), "GPU count"))
     if shutil.which("nvcc") is None:
         raise JobError("The template must include the CUDA development toolkit (nvcc).")
     missing = [tool for tool in ("git", "cmake", "g++") if shutil.which(tool) is None]
@@ -151,38 +162,54 @@ def download_model(
     repo = model.get("repo")
     if not isinstance(repo, str) or not repo:
         raise JobError("Model repository is missing.")
-    filename = model_filename(model.get("filename"))
+    filenames = model_filenames(model.get("filename"))
     revision = commit_sha(model.get("revision"))
     expected_size = positive_int(model.get("size_bytes"), "Model size")
+    files = model.get("files")
+    if files is None and len(filenames) == 1:
+        files = [model]
+    if (
+        not isinstance(files, list) or len(files) != len(filenames)
+        or any(not isinstance(item, dict) for item in files)
+        or [item.get("filename") for item in files] != filenames
+    ):
+        raise JobError("GGUF shard metadata must list the complete ordered set.")
+    sizes = [positive_int(item.get("size_bytes"), "GGUF shard size") for item in files]
+    if sum(sizes) != expected_size:
+        raise JobError("Total model size does not match its GGUF shard metadata.")
+    for item in files:
+        digest = item.get("sha256")
+        if (len(files) > 1 and digest is None) or (
+            digest is not None and (not isinstance(digest, str) or not re.fullmatch(r"[a-f0-9]{64}", digest))
+        ):
+            raise JobError("Invalid or missing GGUF shard SHA-256 metadata.")
     if shutil.disk_usage(root).free < expected_size + 2 * 1024 ** 3:
         raise JobError("Insufficient free disk for the model and inference artifacts.")
-    log(root, "Downloading the selected GGUF inside the instance.", token)
-    try:
-        downloaded = hf_hub_download(
-            repo_id=repo, filename=filename, revision=revision, token=token,
-            local_dir=root / "models", etag_timeout=deadline.timeout(),
-        )
-    except (OSError, ValueError, RuntimeError) as error:
-        raise JobError(f"GGUF download failed: {error_text(error, (token,))}") from error
-    if not isinstance(downloaded, str):
-        raise JobError("Hugging Face did not return a downloaded model path.")
-    path = Path(downloaded).resolve()
-    if path != (root / "models" / filename).resolve():
-        raise JobError("Downloaded model is outside the requested job directory.")
-    if path.stat().st_size != expected_size:
-        raise JobError("Downloaded GGUF size does not match authenticated metadata.")
-    with path.open("rb") as file:
-        if file.read(4) != b"GGUF":
-            raise JobError("Downloaded file is not a GGUF model.")
-    expected_hash = model.get("sha256")
-    if expected_hash is not None:
-        if not isinstance(expected_hash, str) or not re.fullmatch(r"[a-f0-9]{64}", expected_hash):
-            raise JobError("Invalid model SHA-256 metadata.")
-        if sha256_file(path, deadline) != expected_hash:
+    for index, item in enumerate(files, 1):
+        filename = item["filename"]
+        log(root, f"Downloading GGUF file {index}/{len(files)} inside the instance.", token)
+        try:
+            downloaded = hf_hub_download(
+                repo_id=repo, filename=filename, revision=revision, token=token,
+                local_dir=root / "models", etag_timeout=deadline.timeout(),
+            )
+        except (OSError, ValueError, RuntimeError) as error:
+            raise JobError(f"GGUF download failed: {error_text(error, (token,))}") from error
+        if not isinstance(downloaded, str):
+            raise JobError("Hugging Face did not return a downloaded model path.")
+        path = Path(downloaded).resolve()
+        if path != (root / "models" / filename).resolve():
+            raise JobError("Downloaded model is outside the requested job directory.")
+        if path.stat().st_size != item["size_bytes"]:
+            raise JobError("Downloaded GGUF size does not match authenticated metadata.")
+        with path.open("rb") as file:
+            if file.read(4) != b"GGUF":
+                raise JobError("Downloaded file is not a GGUF model.")
+        if item.get("sha256") is not None and sha256_file(path, deadline) != item["sha256"]:
             raise JobError("Downloaded GGUF SHA-256 does not match authenticated metadata.")
-    deadline.remaining()
+        deadline.remaining()
     log(root, "GGUF download and integrity checks complete.", token)
-    return path
+    return (root / "models" / filenames[0]).resolve()
 
 
 def wait_for_server(
@@ -214,6 +241,37 @@ def wait_for_server(
         if response.status_code != 503:
             raise JobError(f"llama-server health check failed: HTTP {response.status_code}.")
         deadline.sleep(1)
+
+
+def verify_server_context(http: requests.Session, url: str, requested: int, deadline: Deadline) -> int:
+    import requests
+
+    timeout = deadline.timeout(5)
+    try:
+        response = http.get(
+            f"{url}/props", timeout=(timeout / 2, timeout / 2), allow_redirects=False,
+        )
+    except requests.RequestException as error:
+        raise JobError(f"llama-server context check failed ({type(error).__name__}).") from error
+    if response.status_code != 200:
+        raise JobError(f"llama-server context check failed: HTTP {response.status_code}.")
+    try:
+        properties = object_value(response.json(), "Model properties")
+    except ValueError as error:
+        raise JobError("llama-server returned invalid context properties JSON.") from error
+    slots = positive_int(properties.get("total_slots"), "Model slot count")
+    defaults = object_value(properties.get("default_generation_settings"), "Model generation settings")
+    available = positive_int(defaults.get("n_ctx"), "Effective model context")
+    if slots != 1:
+        raise JobError("llama-server must provide exactly one job-owned context slot.")
+    if available < requested:
+        raise JobError(
+            f"llama-server serves {available} context tokens, below the requested {requested}. "
+            "The pinned runtime caps slots to the model's training context; choose a "
+            "longer-context GGUF or lower --context-size."
+        )
+    deadline.remaining()
+    return available
 
 
 def server_args(
@@ -349,7 +407,7 @@ def model_runtime(
     temperature = number(request.get("temperature"), "Temperature")
     if max_tokens >= context_size or not 0 <= temperature <= 2:
         raise JobError("Output limit must be below context size; temperature must be between 0 and 2.")
-    gpu = gpu_details(expected_gpu, deadline)
+    gpu = gpu_details(expected_gpu, deadline, positive_int(request.get("gpu_count", 1), "GPU count"))
     model = download_model(
         root, object_value(request.get("model"), "Model configuration"), token, deadline,
     )
@@ -385,6 +443,8 @@ def model_runtime(
                 )
                 wait_for_server(process, url, deadline, http)
                 wait_for_gpu_offload(process, root / "remote.log", log_offset, deadline)
+                available = verify_server_context(http, url, context_size, deadline)
+                log(root, f"llama-server single-slot context verified: {available} tokens.", token)
                 yield ModelRuntime(
                     http, url, gpu, context_size, max_tokens, temperature,
                     (*request_secrets(request), protected_key),

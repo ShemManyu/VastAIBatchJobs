@@ -95,7 +95,7 @@ class FakeClient(VastClient):
 
     def offers(self, template: Template, disk_gb: int, max_price: float,
                rental_seconds: float, deadline: Deadline, *,
-               offer_id: int | None = None) -> list[Offer]:
+               offer_id: int | None = None, gpu_count: int = 1) -> list[Offer]:
         self.events.append("revalidate" if offer_id else "offers")
         return [] if self.fail == "no-offers" else [self.offer]
 
