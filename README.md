@@ -59,6 +59,7 @@ python run_job.py agent \
   --model-repo unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF \
   --model-file Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf \
   --prompt-file ./examples/hardhat-research.md \
+  --verify-script ./examples/verify_hardhat_research.py \
   --agent-env ALCHEMY_API_KEY \
   --agent-env ETHERSCAN_API_KEY \
   --gpu-policy a100-only \
@@ -80,6 +81,7 @@ Available actions are `run` with an argv array, `read_file`, `write_file`, `list
 | Agent option | Default | Meaning |
 | --- | --- | --- |
 | `--input-dir` | None | Snapshot a small local input directory into the remote workspace |
+| `--verify-script` | None | Require a caller-supplied Python verifier to pass before accepting `finish` |
 | `--agent-env NAME` | None | Repeat to select task variables explicitly |
 | `--max-steps` | `30` | Model decisions, including finish attempts; maximum 200 |
 | `--command-timeout-seconds` | `120` | Wall-clock limit per tool invocation; maximum 600 |
@@ -89,6 +91,10 @@ Available actions are `run` with an argv array, `read_file`, `write_file`, `list
 | `--temperature` | `0` | Agent generation temperature |
 
 Other instance/model/output defaults match `run`. Input snapshots are limited to 64 MiB and 5,000 files. Symlinks, hardlinks, special files, common credential paths, and dependency directories are refused. Known credential values are checked before upload; this cannot detect every possible secret, so review selected input files yourself. Relative `--input-dir` paths resolve against the caller's current directory.
+
+`--verify-script` snapshots a trusted, nonempty standard-library Python script of at most 16 KiB before rental, matching the tool's per-argument byte limit. It runs remotely in the workspace with the same non-root identity, approved task variables, and tool limits whenever the model requests `finish`. A nonzero exit, timeout, or tool error rejects finish and returns the observation to the model for correction. The immutable script text is sent through SSH stdin, not copied into the agent-writable workspace or exposed as a local process argument; metadata records its SHA-256. It is not executed on your Mac. Relative paths resolve against the caller's directory.
+
+The supplied verifier checks the Hardhat task's exact contract count, decoded byte lengths, same-block balances/bytecode, hashes, preserved verified source, and report references against fresh API reads. It does not grade subjective reasoning or prove arbitrary generated code safe. Without a verifier, completion means the model finished and artifacts were retrieved, not that every task claim was independently confirmed.
 
 Commands run as a dedicated non-root Linux user with cleared groups/capabilities, no-new-privileges, a clean environment, resource limits, and a private workspace/home. Standard output and error are each bounded to 16 KiB; truncation is explicit. Remaining processes owned by that identity are killed after each action, so background services are not preserved. The model server uses a private API-key file unavailable to tool processes. **This is not a full hostile-code sandbox or an egress firewall.** Tools have internet access and can use approved task keys; trust the task, dependencies, scripts, and rented host. No local filesystem is mounted.
 

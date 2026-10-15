@@ -427,8 +427,11 @@ def agent(root: Path, request: dict[str, Any], deadline: Deadline) -> dict[str, 
         max_steps=positive_int(options.get("max_steps"), "Agent step limit"),
         command_timeout_seconds=number(options.get("command_timeout_seconds"), "Command timeout", positive=True),
         max_artifact_bytes=positive_int(options.get("max_artifact_bytes"), "Artifact byte limit"),
+        verification_code=options.get("verification_code"),
     )
     settings.validate()
+    if options.get("verification_sha256") != settings.public()["verification_sha256"]:
+        raise JobError("Verification script snapshot does not match its checksum.")
     environment = object_value(request.get("task_env", {}), "Task environment")
     if any(not isinstance(value, str) for value in environment.values()):
         raise JobError("Task environment values must be strings.")

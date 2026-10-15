@@ -239,8 +239,18 @@ class FakeAgentTransport(FakeTransport):
             ],
         }
         failed = self.fail == "agent-failed"
+        verification_code = request["agent"].get("verification_code")
+        verification = None
+        if verification_code is not None:
+            verification = {
+                "uid": 2001, "sandbox_verified": True, "exit_code": 0,
+                "timed_out": False, "stdout": "verified\n", "stderr": "",
+            }
         if not failed:
-            transcript["steps"].append({"step": 3, "action": {"action": "finish", "summary": ANSWER}})
+            transcript["steps"].append({
+                "step": 3, "action": {"action": "finish", "summary": ANSWER},
+                "observation": {"finished": True, **({"verification": verification} if verification else {})},
+            })
         self.files["agent-transcript.json"] = (json.dumps(transcript) + "\n").encode()
         self.files["artifacts.tar"] = archive.read_bytes()
         report = {
@@ -250,7 +260,12 @@ class FakeAgentTransport(FakeTransport):
             "environment_names": sorted(request["task_env"]), "archive": info,
             "final_response": None if failed else ANSWER,
             "transcript_sha256": hashlib.sha256(self.files["agent-transcript.json"]).hexdigest(),
+            "verification_sha256": (
+                hashlib.sha256(verification_code.encode()).hexdigest() if verification_code is not None else None
+            ),
         }
+        if verification is not None:
+            report["verification"] = verification
         if failed:
             report["error"] = "Fixture agent exhausted its task deadline."
         else:

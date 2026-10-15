@@ -8,7 +8,7 @@ import tempfile
 import unittest
 
 from agent_utils import (
-    AgentOptions, ARTIFACT_EXCLUDES, extract_archive, inspect_directory,
+    AgentOptions, ARTIFACT_EXCLUDES, MAX_VERIFICATION_BYTES, extract_archive, inspect_directory,
     pack_directory, task_env_name, validate_manifest,
 )
 from job_utils import Deadline, JobError
@@ -129,6 +129,18 @@ class ArchiveTests(unittest.TestCase):
 
 
 class AgentConfigurationTests(unittest.TestCase):
+    def test_verification_snapshot_is_bounded_valid_python_and_only_its_hash_is_public(self):
+        code = "print('CALLER_VERIFIER_SOURCE')\n"
+        options = AgentOptions(verification_code=code)
+        options.validate()
+        self.assertEqual(options.public()["verification_sha256"], hashlib.sha256(code.encode()).hexdigest())
+        self.assertNotIn(code, repr(options))
+        self.assertNotIn("CALLER_VERIFIER_SOURCE", json.dumps(options.public()))
+        AgentOptions(verification_code="pass\n" + "#" * (MAX_VERIFICATION_BYTES - 5)).validate()
+        for invalid in ("", " \n", "pass\n" + "#" * (MAX_VERIFICATION_BYTES - 4), "print(", "pass\0", 42):
+            with self.subTest(code=repr(invalid)[:80]), self.assertRaises(JobError):
+                AgentOptions(verification_code=invalid).validate()
+
     def test_agent_limits_are_bounded_and_exact_boundaries_are_accepted(self):
         AgentOptions(200, 600, 1024 ** 3).validate()
         for options in (

@@ -1,4 +1,5 @@
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -12,9 +13,9 @@ from unittest.mock import MagicMock, patch
 
 from agent_job import ACTION_SCHEMA, Sandbox, bootstrap_tools, parse_action, run_agent, scrub_values
 from agent_tools import ToolError, execute
-from agent_utils import AgentOptions
+from agent_utils import AgentOptions, MAX_VERIFICATION_BYTES
 from job_utils import Deadline, DeadlineExceeded, JobError
-from remote_job import ModelRuntime, model_runtime, server_args
+from remote_job import ModelRuntime, agent, model_runtime, server_args
 from tests.fakes import HF_TOKEN, Response, VAST_TOKEN
 
 
@@ -157,6 +158,74 @@ class AgentLoopTests(unittest.TestCase):
         transcript = json.loads((self.root / "agent-transcript.json").read_text())
         self.assertEqual(transcript["steps"][2]["observation"]["stdout"], "42\n")
 
+    def test_finish_verifier_executes_the_snapshot_and_rejects_incorrect_output_until_fixed(self):
+        code = (
+            "import json\nfrom pathlib import Path\n"
+            "if json.loads(Path('value.json').read_text()).get('value') != 42:\n"
+            "    raise ValueError('Expected the computed value 42.')\n"
+            "print('Verified the actual value 42.')\n"
+        )
+        report = self.run_actions([
+            {"action": "write_file", "path": "value.json", "content": '{"value":7}'},
+            {"action": "write_file", "path": "verification.py", "content": "print('fake success')\n"},
+            {"action": "finish", "summary": "The incorrect output is ready."},
+            {"action": "write_file", "path": "value.json", "content": '{"value":42}'},
+            {"action": "finish", "summary": "The verified output is ready."},
+        ], options=AgentOptions(verification_code=code))
+        self.assertEqual(report["status"], "completed")
+        self.assertEqual(report["steps"], 5)
+        self.assertEqual(report["verification"]["exit_code"], 0)
+        self.assertEqual(report["verification"]["stdout"], "Verified the actual value 42.\n")
+        self.assertEqual((self.root / "response.txt").read_text(), "The verified output is ready.")
+        observation = json.loads(self.model_requests[3]["messages"][-1]["content"].split("\n", 1)[1])
+        self.assertIn("Finish rejected", observation["error"])
+        self.assertNotEqual(observation["verification"]["exit_code"], 0)
+        self.assertIn("Expected the computed value 42.", observation["verification"]["stderr"])
+        verifier_calls = [action for action in self.sandbox.actions if action["action"] == "run"]
+        self.assertEqual(len(verifier_calls), 2)
+        self.assertTrue(all(action["argv"][-1] == code for action in verifier_calls))
+        self.assertTrue(all("-I" in action["argv"] and "-S" in action["argv"] for action in verifier_calls))
+        transcript = json.loads((self.root / "agent-transcript.json").read_text())
+        self.assertNotIn("finished", transcript["steps"][2]["observation"])
+        self.assertEqual(transcript["steps"][-1]["observation"]["verification"], report["verification"])
+
+    def test_permanently_failed_verification_never_publishes_a_success_response(self):
+        report = self.run_actions([
+            {"action": "write_file", "path": "partial.txt", "content": "incomplete evidence"},
+            {"action": "finish", "summary": "Claimed success."},
+        ], options=AgentOptions(max_steps=2, verification_code="raise ValueError('missing verified source')"))
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["steps"], 2)
+        self.assertNotEqual(report["verification"]["exit_code"], 0)
+        self.assertFalse((self.root / "response.txt").exists())
+        self.assertEqual([row["path"] for row in report["archive"]["manifest"]["files"]], ["partial.txt"])
+
+    def test_maximum_size_verifier_really_executes_through_the_argv_limited_tool(self):
+        header = "print('maximum verifier executed')\n"
+        code = header + "#" * (MAX_VERIFICATION_BYTES - len(header.encode()))
+        report = self.run_actions([
+            {"action": "finish", "summary": "The maximum-size verifier passed."},
+        ], options=AgentOptions(max_steps=1, verification_code=code))
+        self.assertEqual(report["status"], "completed")
+        self.assertEqual(report["verification"]["exit_code"], 0)
+        self.assertEqual(report["verification"]["stdout"], "maximum verifier executed\n")
+        self.assertEqual(len(self.sandbox.actions[0]["argv"][-1].encode()), MAX_VERIFICATION_BYTES)
+
+    def test_finish_requires_a_completed_verifier_not_a_timeout_or_success_shaped_error(self):
+        for verification in (
+            {"exit_code": 0, "timed_out": True}, {"exit_code": 0},
+            {"exit_code": False, "timed_out": False}, {"exit_code": 0.0, "timed_out": False},
+            {"exit_code": 0, "timed_out": False, "error": "tool failed"},
+        ):
+            with self.subTest(verification=verification), patch.object(
+                self.sandbox, "execute", return_value=verification,
+            ):
+                report = self.run_actions([
+                    {"action": "finish", "summary": "Claimed success."},
+                ], options=AgentOptions(max_steps=1, verification_code="print('verification')"))
+                self.assertEqual(report["status"], "failed")
+                self.assertFalse((self.root / "response.txt").exists())
+
     def test_five_consecutive_failures_stop_exactly_and_preserve_recovery_evidence(self):
         report = self.run_actions([
             {"action": "run", "argv": [sys.executable, "-c", "import sys; sys.exit(7)"]}
@@ -230,6 +299,33 @@ class AgentLoopTests(unittest.TestCase):
 
 
 class RuntimeAndIsolationTests(unittest.TestCase):
+    def test_remote_agent_uses_the_snapshot_and_rejects_a_missing_or_changed_verifier(self):
+        code = "print('REMOTE_VERIFICATION_SNAPSHOT')\n"
+        options = AgentOptions(verification_code=code)
+        request = {
+            "agent": {**options.public(), "verification_code": code},
+            "task_env": {}, "prompt": "task", "hf_token": HF_TOKEN,
+        }
+        runtime = SimpleNamespace(complete=MagicMock(), gpu={}, secrets=(HF_TOKEN,))
+
+        @contextmanager
+        def local_runtime(*args, **kwargs):
+            yield runtime
+
+        with tempfile.TemporaryDirectory() as directory, \
+             patch("remote_job.model_runtime", side_effect=local_runtime) as model, \
+             patch("agent_job.Sandbox") as sandbox, \
+             patch("agent_job.run_agent", return_value={"status": "completed", "steps": 1}) as loop:
+            agent(Path(directory), request, Deadline(10))
+            self.assertEqual(loop.call_args.args[2].verification_code, code)
+            self.assertEqual(sandbox.call_args.args[1].verification_code, code)
+            for changed in (None, "print('changed')\n"):
+                with self.subTest(changed=changed), self.assertRaises(JobError):
+                    agent(Path(directory), {
+                        **request, "agent": {**request["agent"], "verification_code": changed},
+                    }, Deadline(10))
+            self.assertEqual(model.call_count, 1)
+
     def test_token_budget_checks_the_measured_boundary_before_generation(self):
         for limit, allowed in ((5, True), (4, False)):
             with self.subTest(limit=limit):

@@ -21,7 +21,7 @@ import uuid
 
 from agent_utils import (
     ARTIFACT_EXCLUDES, AgentOptions, MAX_INPUT_BYTES, TOOL_OUTPUT_BYTES,
-    extract_archive, pack_directory, relative_name, task_env_name,
+    command_succeeded, extract_archive, pack_directory, relative_name, task_env_name,
 )
 from job_utils import (
     Deadline, JobError, LLAMA_COMMIT, atomic_write, completion_text, error_text,
@@ -370,6 +370,12 @@ def run_agent(
         remaining - min(20, remaining / 4), clock=deadline.clock, sleeper=deadline.sleeper,
     )
     system = SYSTEM_PROMPT + "\nApproved task environment names: " + ", ".join(sorted(sandbox.task_env))
+    if options.verification_code is not None:
+        system += (
+            "\nA caller-provided verification script runs when you request finish. "
+            "Failed verification rejects finish and returns its actual output. "
+            "Correct the task artifacts before retrying; you cannot replace the caller's verifier."
+        )
     messages = [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
     transcript: dict[str, Any] = {
         "version": 1, "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(), "steps": [],
@@ -378,6 +384,7 @@ def run_agent(
         "status": "failed", "llama_commit": LLAMA_COMMIT, **gpu,
         "steps": 0, "max_steps": options.max_steps, "environment_names": sorted(sandbox.task_env),
         "final_response": None, "archive": None,
+        "verification_sha256": options.public()["verification_sha256"],
     }
     archive_info: dict[str, Any] | None = None
     consecutive_failures = 0
@@ -395,15 +402,31 @@ def run_agent(
                 if any(secret and secret in summary for secret in secrets):
                     raise JobError("Agent final response contained a credential value.")
                 sandbox.stop_children()
+                verification = None
                 try:
+                    if options.verification_code is not None:
+                        verification = sandbox.execute({
+                            "action": "run",
+                            "argv": [
+                                str(Path(sys.executable).resolve()), "-I", "-S", "-c",
+                                options.verification_code,
+                            ],
+                        }, actions_deadline)
+                        report["verification"] = verification
+                        if not command_succeeded(verification):
+                            raise JobError("Caller-provided task verification did not pass.")
                     archive_info = pack_directory(
                         sandbox.workspace, root / "artifacts.tar", actions_deadline,
                         maximum=options.max_artifact_bytes, secrets=secrets, excludes=ARTIFACT_EXCLUDES,
                     )
                 except (JobError, OSError) as error:
                     observation = {"error": "Finish rejected: " + error_text(error, secrets)}
+                    if verification is not None:
+                        observation["verification"] = verification
                 else:
                     record["observation"] = {"finished": True}
+                    if verification is not None:
+                        record["observation"]["verification"] = verification
                     report["final_response"] = summary
                     report["status"] = "completed"
                     atomic_write(root / "response.txt", summary.encode())

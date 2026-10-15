@@ -20,7 +20,8 @@ from typing import Any, Callable, Iterable, Iterator
 import uuid
 
 from agent_utils import (
-    AgentOptions, MAX_INPUT_BYTES, extract_archive, inspect_directory, pack_directory,
+    AgentOptions, MAX_INPUT_BYTES, MAX_VERIFICATION_BYTES, command_succeeded,
+    extract_archive, inspect_directory, pack_directory,
     task_env_name, validate_manifest,
 )
 from job_utils import (
@@ -108,6 +109,10 @@ class Settings:
             raise JobError("Both VastAI and Hugging Face credentials are required.")
         if self.agent is not None:
             self.agent.validate()
+            if self.agent.verification_code is not None and any(
+                secret and secret in self.agent.verification_code for secret in self.credentials.secrets
+            ):
+                raise JobError("Verification script must not embed credential values.")
             if len(self.credentials.task) > 20:
                 raise JobError("At most 20 task environment variables may be forwarded.")
             for name, value in self.credentials.task.items():
@@ -640,6 +645,29 @@ def retrieve_agent(
             state.data["warnings"].append(warning)
             state.log(warning)
         summary = report.get("final_response")
+        if options.verification_code is not None:
+            if report.get("verification_sha256") != options.public()["verification_sha256"]:
+                raise JobError("Agent did not use the caller's verification script snapshot.")
+            if report["status"] == "completed":
+                verification = object_value(report.get("verification"), "Agent verification")
+                uid = verification.get("uid")
+                if (
+                    not command_succeeded(verification)
+                    or verification.get("sandbox_verified") is not True
+                    or isinstance(uid, bool) or not isinstance(uid, int) or uid <= 0
+                ):
+                    raise JobError("Completed agent has no successful non-root task verification.")
+                final_step = object_value(transcript["steps"][-1], "Final agent decision") if steps else {}
+                final_action = object_value(final_step.get("action"), "Final agent action")
+                final_observation = object_value(final_step.get("observation"), "Final agent observation")
+                if (
+                    final_action.get("action") != "finish"
+                    or final_observation.get("finished") is not True
+                    or final_observation.get("verification") != verification
+                ):
+                    raise JobError("Agent verification does not match the final execution observation.")
+            state.data["agent"]["verification_sha256"] = report["verification_sha256"]
+            state.data["agent"]["verification"] = report.get("verification")
         if summary is not None:
             if not isinstance(summary, str) or not summary.strip():
                 raise JobError("Agent final response is invalid.")
@@ -803,7 +831,10 @@ def run_workflow(
         }
         if settings.agent is not None:
             request.update({
-                "agent": settings.agent.public(), "task_env": settings.credentials.task, "inputs": input_bundle,
+                "agent": {
+                    **settings.agent.public(), "verification_code": settings.agent.verification_code,
+                },
+                "task_env": settings.credentials.task, "inputs": input_bundle,
             })
         report = transport.invoke("agent" if settings.agent is not None else "infer", request, deadline)
         gpu_name = report.get("gpu_name")
@@ -922,6 +953,8 @@ def parser_for_cli() -> argparse.ArgumentParser:
         run.add_argument("--dry-run", action="store_true", help="Only validate and query metadata/offers.")
         if name == "agent":
             run.add_argument("--input-dir", type=Path, help="Optional small, credential-free workspace snapshot.")
+            run.add_argument("--verify-script", type=Path,
+                             help="Snapshot a trusted standard-library Python verifier; require exit 0 before finish.")
             run.add_argument("--agent-env", action="append", default=[], metavar="NAME",
                              help="Forward only this selected task variable from the chosen .env/environment.")
             run.add_argument("--max-steps", type=int, default=30)
@@ -976,9 +1009,16 @@ def main(argv: list[str] | None = None) -> int:
             prompt = args.prompt
         agent_options = None
         if args.command == "agent":
+            verification_code = None
+            if args.verify_script is not None:
+                if args.verify_script.is_symlink() or not args.verify_script.is_file():
+                    raise JobError("Verification script must be a regular file, not a symlink.")
+                with args.verify_script.open("rb") as source:
+                    verification_code = source.read(MAX_VERIFICATION_BYTES + 1).decode("utf-8")
             agent_options = AgentOptions(
                 args.max_steps, args.command_timeout_seconds, args.max_artifact_mb * 1024 ** 2,
                 args.input_dir.absolute() if args.input_dir is not None else None,
+                verification_code=verification_code,
             )
         settings = Settings(
             args.model_repo, args.model_file, prompt, credentials,

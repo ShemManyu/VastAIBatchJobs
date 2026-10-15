@@ -1,6 +1,7 @@
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from dataclasses import replace
 import io
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -151,6 +152,65 @@ class AgentWorkflowTests(unittest.TestCase):
                 self.run_workflow(client, settings=settings)
         self.assertEqual(client.created, 0)
 
+    def test_verifier_cannot_embed_any_controller_or_task_credential_before_rental(self):
+        client = FakeClient()
+        for secret in (VAST_TOKEN, HF_TOKEN, TASK_KEY):
+            options = AgentOptions(verification_code=f"print({secret!r})\n")
+            with self.subTest(secret=secret), self.assertRaises(JobError):
+                self.run_workflow(client, settings=replace(self.settings, agent=options))
+        self.assertEqual(client.created, 0)
+
+    def test_completed_agent_cannot_skip_the_requested_finish_verification(self):
+        options = AgentOptions(verification_code="print('verified')\n")
+        original = FakeAgentTransport.invoke
+
+        def omitted(transport, stage, request, deadline):
+            if stage == "agent":
+                request = {**request, "agent": {**request["agent"], "verification_code": None}}
+            return original(transport, stage, request, deadline)
+
+        client = FakeClient()
+        with patch.object(FakeAgentTransport, "invoke", omitted), self.assertRaises(JobError):
+            self.run_workflow(client, settings=replace(self.settings, agent=options))
+        metadata, output = self.latest()
+        self.assertEqual(metadata["job_status"], "failed")
+        self.assertEqual(metadata["cleanup_status"], "confirmed")
+        self.assertFalse((output / "response.txt").exists())
+        self.assertTrue((output / "artifacts/scripts/task.py").is_file())
+        self.assertEqual(client.destroyed, 1)
+
+    def test_reported_verifier_failure_or_unverified_identity_cannot_become_workflow_success(self):
+        options = AgentOptions(verification_code="print('verified')\n")
+        original = FakeAgentTransport.invoke
+        for invalid in (
+            None, {"exit_code": 1}, {"timed_out": True}, {"uid": 0},
+            {"uid": True}, {"sandbox_verified": False},
+        ):
+            with self.subTest(invalid=invalid):
+                def forged(transport, stage, request, deadline):
+                    report = original(transport, stage, request, deadline)
+                    if stage == "agent":
+                        report = {key: value for key, value in report.items() if key != "agent_report_sha256"}
+                        report["verification"] = (
+                            {**report["verification"], **invalid} if invalid is not None else None
+                        )
+                        transport.files["agent-report.json"] = (json.dumps(report) + "\n").encode()
+                        return {
+                            **report,
+                            "agent_report_sha256": hashlib.sha256(transport.files["agent-report.json"]).hexdigest(),
+                        }
+                    return report
+
+                client = FakeClient()
+                with patch.object(FakeAgentTransport, "invoke", forged), self.assertRaises(JobError):
+                    self.run_workflow(client, settings=replace(self.settings, agent=options))
+                metadata, output = self.latest()
+                self.assertEqual(metadata["job_status"], "failed")
+                self.assertEqual(metadata["cleanup_status"], "confirmed")
+                self.assertFalse((output / "response.txt").exists())
+                self.assertTrue((output / "artifacts/scripts/task.py").is_file())
+                self.assertEqual(client.destroyed, 1)
+
     def test_agent_stage_and_transfer_failures_still_confirm_destruction(self):
         for failure in ("upload-agent", "bootstrap", "agent", "agent-archive"):
             with self.subTest(failure=failure):
@@ -198,6 +258,9 @@ class AgentWorkflowTests(unittest.TestCase):
         )
         task = self.root / "task.md"
         task.write_text(self.settings.prompt)
+        verifier = self.root / "verify.py"
+        verifier_code = "print('CALLER_VERIFIER_SOURCE')\n"
+        verifier.write_text(verifier_code)
         client = FakeClient()
         stdout = io.StringIO()
         with ExitStack() as stack:
@@ -215,6 +278,7 @@ class AgentWorkflowTests(unittest.TestCase):
             result = main([
                 "agent", "--model-repo", "unit/model", "--model-file", "model-Q4_K_M.gguf",
                 "--prompt-file", str(task), "--agent-env", "ALCHEMY_API_KEY",
+                "--verify-script", str(verifier),
             ])
         self.assertEqual(result, 0)
         request = self.transports[-1].requests[-1][1]
@@ -223,6 +287,13 @@ class AgentWorkflowTests(unittest.TestCase):
         self.assertEqual(request["context_size"], 16384)
         self.assertEqual(request["max_tokens"], 2048)
         self.assertEqual(request["temperature"], 0)
+        self.assertEqual(request["agent"]["verification_code"], verifier_code)
+        metadata, output = self.latest()
+        self.assertEqual(
+            metadata["settings"]["agent"]["verification_sha256"], hashlib.sha256(verifier_code.encode()).hexdigest(),
+        )
+        self.assertEqual(metadata["agent"]["verification"]["exit_code"], 0)
+        self.assertNotIn(verifier_code, (output / "metadata.json").read_text())
         self.assertNotIn("UNSELECTED_KEY", json.dumps(request))
         self.assertIn("Agent files:", stdout.getvalue())
         self.assertTrue(client.closed)

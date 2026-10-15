@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 import os
@@ -17,6 +17,7 @@ from job_utils import Deadline, JobError, number, object_value, positive_int, sh
 MAX_INPUT_BYTES = 64 * 1024 ** 2
 MAX_ARCHIVE_FILES = 5000
 TOOL_OUTPUT_BYTES = 16 * 1024
+MAX_VERIFICATION_BYTES = 16 * 1024
 ARTIFACT_EXCLUDES = frozenset({
     "node_modules", ".git", ".venv", "venv", "__pycache__", ".cache", ".npm",
 })
@@ -28,6 +29,7 @@ class AgentOptions:
     command_timeout_seconds: float = 120
     max_artifact_bytes: int = 64 * 1024 ** 2
     input_dir: Path | None = None
+    verification_code: str | None = field(default=None, repr=False)
 
     def validate(self) -> None:
         if positive_int(self.max_steps, "Agent step limit") > 200:
@@ -39,6 +41,17 @@ class AgentOptions:
             raise JobError("Artifact limit must not exceed 1 GiB.")
         if self.input_dir is not None:
             inspect_directory(self.input_dir, MAX_INPUT_BYTES, input_files=True)
+        if self.verification_code is not None:
+            if (
+                not isinstance(self.verification_code, str) or not self.verification_code.strip()
+                or len(self.verification_code.encode("utf-8")) > MAX_VERIFICATION_BYTES
+                or "\0" in self.verification_code
+            ):
+                raise JobError("Verification script must be non-empty UTF-8 Python of at most 16 KiB.")
+            try:
+                compile(self.verification_code, "<agent verification>", "exec")
+            except SyntaxError as error:
+                raise JobError("Verification script has invalid Python syntax.") from error
 
     def public(self) -> dict[str, Any]:
         return {
@@ -47,7 +60,19 @@ class AgentOptions:
             "max_artifact_bytes": self.max_artifact_bytes,
             "tool_output_bytes": TOOL_OUTPUT_BYTES,
             "has_input_directory": self.input_dir is not None,
+            "verification_sha256": (
+                hashlib.sha256(self.verification_code.encode("utf-8")).hexdigest()
+                if self.verification_code is not None else None
+            ),
         }
+
+
+def command_succeeded(result: dict[str, Any]) -> bool:
+    exit_code = result.get("exit_code")
+    return (
+        "error" not in result and isinstance(exit_code, int) and not isinstance(exit_code, bool)
+        and exit_code == 0 and result.get("timed_out") is False
+    )
 
 
 def task_env_name(name: str) -> str:

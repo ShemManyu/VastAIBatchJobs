@@ -20,6 +20,8 @@ request signing keys, or use a live network for transaction execution.
 - Install these compatible pins locally: `hardhat@2.29.1`,
   `@nomicfoundation/hardhat-ethers@3.1.3`, and `ethers@6.17.0`.
   Use npm's `--no-audit --no-fund` options to keep output small.
+  Declare exact versions in `package.json`, not caret/tilde ranges; use
+  `--save-exact` if npm creates dependency declarations.
 - Do not install an upgrades plugin, toolbox, or OpenZeppelin package. This
   read-only task needs only the three specified packages. If an import fails,
   inspect the config/script and remove an unnecessary import instead of
@@ -34,6 +36,8 @@ request signing keys, or use a live network for transaction execution.
    No Solidity compilation is necessary.
    The config must use `require("@nomicfoundation/hardhat-ethers")`; do not
    substitute a bare `require("ethers")` for loading the Hardhat plugin.
+   Set `paths.cache` to `.cache/hardhat` so fork caches are excluded from
+   returned artifacts. Create output directories before writing results.
 2. Create `scripts/read-balances.cjs`. Randomly sample two different addresses
    from this pool of known non-proxy, verified mainnet contracts:
    - WETH9: `0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2`
@@ -43,6 +47,8 @@ request signing keys, or use a live network for transaction execution.
    deployed code for both selected addresses. Use Hardhat's ethers provider to
    read their native ETH balances on the fork and its block number. Record
    balances as decimal wei strings and formatted ETH strings.
+   Record deployed code length in **bytes**, using `(code.length - 2) / 2`
+   or `Buffer.from(code.slice(2), "hex").length`, not `code.length`.
 3. Execute the script with
    `npx hardhat run scripts/read-balances.cjs --no-compile`.
    Check its actual exit code and output. The script must write
@@ -60,13 +66,28 @@ request signing keys, or use a live network for transaction execution.
    ```
    Replace all placeholders with observed values; there must be two contracts.
    A zero ETH balance is valid, but empty contract code is not.
-4. Create and execute `scripts/fetch-sources.cjs`. Read the selected addresses
+4. Create and execute `scripts/fetch-sources.cjs` with
+   `node scripts/fetch-sources.cjs`. Read the selected addresses
    and fork block from `outputs/balances.json`. For each address:
    - Call Alchemy `eth_getCode` with the same block encoded as a hex quantity.
      Save the full bytecode and SHA-256 of its decoded bytes.
+     Use Node's built-in `fetch` to POST JSON-RPC to the Alchemy URL above;
+     check HTTP success and reject a JSON-RPC `error`.
    - Call Etherscan's verified-source endpoint. Check HTTP success, API status
      `1`, and nonempty `SourceCode`. Do not treat an error or missing source as
      success. Pause between requests if needed for the free API rate limit.
+     Construct the URL like this, including **both `/v2/api` and `chainid=1`**:
+     ```js
+     const url = new URL("https://api.etherscan.io/v2/api");
+     url.search = new URLSearchParams({
+       chainid: "1", module: "contract", action: "getsourcecode",
+       address, apikey: process.env.ETHERSCAN_API_KEY
+     }).toString();
+     ```
+     If the API says "Missing chainid", add `chainid=1` without changing
+     `/v2/api`. Never switch to the deprecated `/api` endpoint.
+     Do not skip a failed contract, create placeholder Solidity, or substitute
+     remembered contract behavior for downloaded source.
    - Save the original response to `sources/<address>/etherscan.json`.
      Save the verified source as `sources/<address>/contract.sol`, preserving
      its license notices. If the response is wrapped standard-input JSON,
@@ -106,3 +127,15 @@ request signing keys, or use a live network for transaction execution.
 Keep scripts compact enough to write in individual actions. Correct observed
 errors instead of claiming success. Do not copy `node_modules` or caches into
 the report; the workflow returns useful files and excludes dependencies.
+
+Both scripts must signal failure with a nonzero process exit code. Use
+`main().catch(error => { console.error(error.message); process.exitCode = 1; });`,
+not `main().catch(console.error)`, which prints an error while exiting zero.
+Inspect stderr as well as the exit code; an error message is not success.
+
+The example command supplies an independent finish verifier. It rechecks the
+recorded balances/bytecode against Alchemy and verified Solidity against
+Etherscan. A failed finish returns the actual check error so you can correct
+your scripts and rerun them. The verifier cannot be replaced from the workspace.
+Read the actual saved source before writing the report; use `next_offset` to
+read remaining pages when a source file is longer than one tool response.
