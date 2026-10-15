@@ -158,7 +158,8 @@ class AgentConfigurationTests(unittest.TestCase):
         self.assertEqual(task_env_name("ALCHEMY_API_KEY"), "ALCHEMY_API_KEY")
         self.assertEqual(task_env_name("ETHERSCAN_API_KEY"), "ETHERSCAN_API_KEY")
         for name in ("VAST_AI_API_KEY", "HF_TOKEN", "HUGGING_FACE_ACCESS_TOKEN", "PATH", "HOME",
-                     "LD_PRELOAD", "PYTHONPATH", "LLAMA_API_KEY", "BASH_ENV", "invalid-name"):
+                     "LD_PRELOAD", "PYTHONPATH", "LLAMA_API_KEY", "BASH_ENV",
+                     "TOKIO_WORKER_THREADS", "invalid-name"):
             with self.subTest(name=name), self.assertRaises(JobError):
                 task_env_name(name)
 

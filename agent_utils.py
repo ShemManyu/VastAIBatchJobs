@@ -78,7 +78,10 @@ def command_succeeded(result: dict[str, Any]) -> bool:
 def task_env_name(name: str) -> str:
     if not re.fullmatch(r"[A-Z_][A-Z0-9_]*", name):
         raise JobError("Task environment names must be uppercase identifiers.")
-    if name in {"PATH", "HOME", "USER", "LOGNAME", "SHELL", "ENV", "BASH_ENV"} or name.startswith(
+    if name in {
+        "PATH", "HOME", "USER", "LOGNAME", "SHELL", "ENV", "BASH_ENV",
+        "TOKIO_WORKER_THREADS",
+    } or name.startswith(
         ("VAST", "HF_", "HUGGING", "LLAMA", "PYTHON", "LD_", "DYLD_")
     ):
         raise JobError(f"{name} is reserved and cannot be forwarded to agent tools.")

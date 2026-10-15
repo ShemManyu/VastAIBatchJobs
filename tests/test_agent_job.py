@@ -424,6 +424,19 @@ class RuntimeAndIsolationTests(unittest.TestCase):
         self.assertEqual(result["stdout"], "[REDACTED]")
         self.assertEqual(stops, 1)
 
+    def test_native_worker_pool_is_bounded_despite_larger_parent_environment(self):
+        with patch.dict(os.environ, {"TOKIO_WORKER_THREADS": "128"}):
+            for action in (
+                {"action": "run", "argv": ["node", "task.cjs"]},
+                {"action": "list_files", "path": "."},
+            ):
+                with self.subTest(action=action):
+                    _, spawn, _, _ = self.sandbox_call(
+                        {"uid": 2001, "sandbox_verified": True, "exit_code": 0},
+                        action,
+                    )
+                    self.assertEqual(spawn.kwargs["env"].get("TOKIO_WORKER_THREADS"), "2")
+
     def test_file_tools_do_not_receive_even_the_approved_task_credentials(self):
         _, spawn, _, _ = self.sandbox_call(
             {"uid": 2001, "sandbox_verified": True, "entries": []},

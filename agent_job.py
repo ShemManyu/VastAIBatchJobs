@@ -310,6 +310,7 @@ class Sandbox:
             "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
             "NODE_OPTIONS": "--max-old-space-size=1024",
             "RAYON_NUM_THREADS": "2", "UV_THREADPOOL_SIZE": "4",
+            "TOKIO_WORKER_THREADS": "2",
             "OMP_NUM_THREADS": "2", "OPENBLAS_NUM_THREADS": "2",
         }
         if action["action"] == "run":

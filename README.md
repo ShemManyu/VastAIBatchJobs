@@ -101,6 +101,12 @@ The supplied verifier checks the Hardhat task's exact contract count, decoded by
 
 Commands run as a dedicated non-root Linux user with cleared groups/capabilities, no-new-privileges, a clean environment, resource limits, and a private workspace/home. Standard output and error are each bounded to 16 KiB; truncation is explicit. Remaining processes owned by that identity are killed after each action, so background services are not preserved. The model server uses a private API-key file unavailable to tool processes. **This is not a full hostile-code sandbox or an egress firewall.** Tools have internet access and can use approved task keys; trust the task, dependencies, scripts, and rented host. No local filesystem is mounted.
 
+Native Tokio worker pools are bounded to two threads. On many-core hosts, larger
+pools can exceed the tool identity's 64-process/thread limit: a Hardhat script
+can abort while its CLI still exits zero. `TOKIO_WORKER_THREADS` is reserved and
+cannot be forwarded with `--agent-env`. Check actual output and expected files,
+not only the CLI exit code.
+
 Agent output:
 
 ```text
