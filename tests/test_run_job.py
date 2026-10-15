@@ -207,6 +207,51 @@ class WorkflowTests(unittest.TestCase):
             self.execute(client)
         self.assertEqual(client.created, 0)
 
+    def test_requested_offer_restricts_selection_and_never_falls_back(self):
+        client = FakeClient()
+        requested = replace(client.offer, id=20, hourly_price=2)
+        settings = replace(self.settings, offer_id=20)
+        self.assertEqual(run_job.select_offer(settings, [client.offer, requested]), requested)
+        with self.assertRaises(JobError):
+            run_job.select_offer(settings, [client.offer])
+
+    def test_requested_offer_is_queried_and_revalidated_before_creation(self):
+        client = FakeClient()
+        requested = replace(client.offer, id=20, hourly_price=2)
+        with patch.object(client, "offers", return_value=[client.offer, requested]) as search:
+            state = self.execute(client, settings=replace(self.settings, offer_id=20))
+        self.assertEqual([call.kwargs["offer_id"] for call in search.call_args_list], [20, 20])
+        self.assertEqual(state.data["offer"]["offer_id"], 20)
+        self.assertEqual(state.data["settings"]["requested_offer_id"], 20)
+        self.assertEqual(client.created, 1)
+        self.assertEqual(client.destroyed, 1)
+
+    def test_invalid_or_ineligible_requested_offers_never_rent(self):
+        for value in (0, -1, True, "20", 1.5):
+            with self.subTest(offer_id=value):
+                client = FakeClient()
+                with self.assertRaises(JobError):
+                    self.execute(client, settings=replace(self.settings, offer_id=value))
+                self.assertEqual(client.created, 0)
+        client = FakeClient()
+        valid = replace(client.offer, upload_cost_per_gb=0.01)
+        settings = replace(
+            self.settings, offer_id=20, gpu_policy="a100-only",
+            max_hourly_price=1, max_bandwidth_price=0.01,
+        )
+        variants = (
+            replace(valid, id=20, hourly_price=1.0001),
+            replace(valid, id=20, gpu_ram_mb=23999),
+            replace(valid, id=20, gpu_name="RTX 3090"),
+            replace(valid, id=20, upload_cost_per_gb=0.010001),
+        )
+        for requested in variants:
+            with self.subTest(requested=requested):
+                with patch.object(client, "offers", return_value=[valid, requested]):
+                    with self.assertRaises(JobError):
+                        self.execute(client, settings=settings)
+                self.assertEqual(client.created, 0)
+
     def test_hugging_face_access_denial_happens_before_rental(self):
         client = FakeClient()
         with patch("run_job.shutil.which", return_value="/fixture/tool"), \
@@ -358,6 +403,26 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(client.created, 0)
         self.assertFalse((self.base / ".vastai-runs").exists())
         self.assertFalse((self.base / "modeloutput").exists())
+
+    def test_cli_offer_override_controls_the_actual_dry_run_selection(self):
+        client = FakeClient()
+        requested = replace(client.offer, id=20, hourly_price=2)
+        stdout = io.StringIO()
+        env = self.base / ".env"
+        env.write_text(f"VAST_AI_API_KEY={VAST_TOKEN}\nHUGGING_FACE_ACCESS_TOKEN={HF_TOKEN}\n")
+        with patch("run_job.ROOT", self.base), patch.dict(os.environ, {}, clear=True), \
+             patch("run_job.VastClient", return_value=client), \
+             patch.object(client, "offers", return_value=[client.offer, requested]) as search, \
+             patch("run_job.inspect_model", return_value=dict(MODEL)), redirect_stdout(stdout):
+            result = main(["run", "--model-repo", "unit/model", "--model-file", "model-Q4_K_M.gguf",
+                           "--prompt", "test", "--offer-id", "20", "--dry-run"])
+        self.assertEqual(result, 0)
+        preview = json.loads(stdout.getvalue())
+        self.assertEqual(preview["selected_offer"]["offer_id"], 20)
+        self.assertEqual(preview["limits"]["requested_offer_id"], 20)
+        self.assertEqual(search.call_args.kwargs["offer_id"], 20)
+        self.assertEqual(client.created, 0)
+        self.assertFalse((self.base / ".vastai-runs").exists())
 
     def test_cli_prompt_file_and_relative_overrides_resolve_against_the_caller(self):
         client = FakeClient()

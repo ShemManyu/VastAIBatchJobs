@@ -126,6 +126,7 @@ Credential-bearing files or unsafe/oversized archives are refused rather than si
 | --- | --- | --- |
 | `--model-revision` | `main` | Resolved and recorded as a full commit before rental |
 | `--template-hash` | `661d064bbda1f2a133816b6d55da07c3` | Compatible CUDA development/SSH template |
+| `--offer-id` | None | Select one eligible marketplace offer; never silently fall back |
 | `--gpu-policy` | `prefer-a100` | Prefer any eligible A100; fall back to another compatible NVIDIA GPU. `a100-only` forbids fallback |
 | `--max-hourly-price` | `4.00` | Advertised USD/hour cap, including the requested storage |
 | `--max-bandwidth-price` | None | Optional advertised USD/GB cap for both ingress and egress, rechecked before creation |
@@ -142,6 +143,12 @@ The default template is pinned to `pytorch/pytorch:2.4.0-cuda12.4-cudnn9-devel`.
 Offer selection requires one NVIDIA GPU with at least **24,000 MB per-GPU VRAM** according to VastAI's API units, an AMD64 host, at least 16,000 MB system RAM, sufficient disk/rental duration, verified/rentable status, and reliability of at least 0.98. Template hardware filters also apply. The default CUDA 12.4 image admits compute capabilities 7.5 through 9.0, excluding newer Blackwell GPUs; CUDA 12.8+ overrides admit capabilities through 12.0.
 
 An eligible A100 wins over a cheaper non-A100. Within the preference tier, the lowest hourly price wins. Searches follow full result pages rather than assuming the first mixed-GPU page contains all available A100s.
+
+Use `--offer-id` to select a different host after a marketplace/SSH failure. This is
+the rentable offer ID, not a previously created instance ID. The selected offer
+still passes template, GPU, duration, storage, and price checks and is revalidated
+before rental. An unavailable or ineligible selection fails without falling back.
+Confirm the previous run's cleanup before starting another paid attempt.
 
 Default paths resolve relative to `run_job.py`, even when invoked from another directory. Explicit relative `--env-file`, `--output-dir`, and `--prompt-file` paths resolve against your current working directory.
 

@@ -82,6 +82,7 @@ class Settings:
     temperature: float = 0.7
     agent: AgentOptions | None = None
     max_bandwidth_price: float | None = None
+    offer_id: int | None = None
 
     def validate(self) -> None:
         if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", self.model_repo):
@@ -105,6 +106,8 @@ class Settings:
             raise JobError("Output tokens must be below context size; temperature must be between 0 and 2.")
         if self.gpu_policy not in ("prefer-a100", "a100-only"):
             raise JobError("GPU policy must be prefer-a100 or a100-only.")
+        if self.offer_id is not None:
+            positive_int(self.offer_id, "Requested offer ID")
         if not self.credentials.vast.strip() or not self.credentials.hugging_face.strip():
             raise JobError("Both VastAI and Hugging Face credentials are required.")
         if self.agent is not None:
@@ -208,12 +211,16 @@ def preflight(
         )
     offers = client.offers(
         template, settings.disk_gb, settings.max_hourly_price,
-        settings.timeout_minutes * 60 + CLEANUP_SECONDS, deadline,
+        settings.timeout_minutes * 60 + CLEANUP_SECONDS, deadline, offer_id=settings.offer_id,
     )
     return model, template, select_offer(settings, offers)
 
 
 def select_offer(settings: Settings, offers: list[Offer]) -> Offer:
+    if settings.offer_id is not None:
+        offers = [offer for offer in offers if offer.id == settings.offer_id]
+        if not offers:
+            raise JobError(f"Requested offer {settings.offer_id} is unavailable or ineligible.")
     if settings.max_bandwidth_price is not None:
         offers = [
             offer for offer in offers
@@ -236,6 +243,7 @@ def preview(settings: Settings, model: dict[str, Any], template: Template, offer
         "output_dir": str(settings.output_dir),
         "limits": {
             "max_hourly_price_usd": settings.max_hourly_price,
+            "requested_offer_id": settings.offer_id,
             "timeout_minutes": settings.timeout_minutes,
             "cleanup_seconds": CLEANUP_SECONDS, "disk_gb": settings.disk_gb,
             "context_size": settings.context_size, "max_tokens": settings.max_tokens,
@@ -756,6 +764,7 @@ def run_workflow(
         "offer": offer.summary(), "llama_release": LLAMA_RELEASE, "llama_commit": LLAMA_COMMIT,
         "settings": {
             "max_hourly_price_usd": settings.max_hourly_price,
+            "requested_offer_id": settings.offer_id,
             "timeout_minutes": settings.timeout_minutes, "gpu_policy": settings.gpu_policy,
             "disk_gb": settings.disk_gb, "context_size": settings.context_size,
             "max_tokens": settings.max_tokens, "temperature": settings.temperature,
@@ -939,6 +948,8 @@ def parser_for_cli() -> argparse.ArgumentParser:
         prompt.add_argument("--prompt-file", type=Path, help="UTF-8 task/prompt file, including Markdown.")
         run.add_argument("--model-revision", default="main")
         run.add_argument("--template-hash", default=DEFAULT_TEMPLATE_HASH)
+        run.add_argument("--offer-id", type=int,
+                         help="Select one marketplace offer without bypassing compatibility or price checks.")
         run.add_argument("--env-file", type=Path, default=ROOT / ".env")
         run.add_argument("--output-dir", type=Path, default=ROOT / "modeloutput")
         run.add_argument("--max-hourly-price", type=float, default=4.0)
@@ -1028,6 +1039,7 @@ def main(argv: list[str] | None = None) -> int:
             args.context_size, args.max_tokens, args.temperature,
             agent_options,
             args.max_bandwidth_price,
+            args.offer_id,
         )
         settings.validate()
         if args.dry_run:
