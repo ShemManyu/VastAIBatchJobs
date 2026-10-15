@@ -228,6 +228,8 @@ class VastClient:
             raise JobError("Template is missing its image or pinned tag.")
         image = f"{image}:{tag}"
         cuda = re.search(r"cuda(\d+\.\d+)", image, re.IGNORECASE)
+        if cuda is None and row["image"] == "nvidia/cuda":
+            cuda = re.match(r"(\d+\.\d+)(?:\.\d+)?-", tag)
         if "devel" not in image.lower() or cuda is None:
             raise JobError("Select a CUDA development template with a pinned cudaX.Y-devel image.")
         if hash_id == DEFAULT_TEMPLATE_HASH and image != DEFAULT_IMAGE:

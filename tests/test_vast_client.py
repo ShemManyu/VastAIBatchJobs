@@ -81,6 +81,27 @@ class ApiTests(unittest.TestCase):
                 with self.assertRaises(JobError):
                     client.template(DEFAULT_TEMPLATE_HASH, Deadline(10))
 
+    def test_official_cuda_version_tags_are_accepted_without_changing_the_default_pin(self):
+        template_hash = "5ec457ba5e023038cdcfe7d4aab5c207"
+        client, _ = self.client(Response({"templates": [{
+            "hash_id": template_hash, "image": "nvidia/cuda",
+            "tag": "12.4.1-devel-ubuntu22.04", "recommended_disk_space": 16,
+            "extra_filters": {"cpu_arch": {"in": ["amd64", "arm64"]}},
+        }]}))
+        template = client.template(template_hash, Deadline(10))
+        self.assertEqual(template.image, "nvidia/cuda:12.4.1-devel-ubuntu22.04")
+        self.assertEqual(template.cuda_version, 12.4)
+        self.assertEqual(template.recommended_disk, 16)
+
+    def test_a_numeric_tag_on_an_unrelated_repository_is_not_a_cuda_template(self):
+        template_hash = "5ec457ba5e023038cdcfe7d4aab5c207"
+        client, _ = self.client(Response({"templates": [{
+            "hash_id": template_hash, "image": "unrelated/image",
+            "tag": "12.4.1-devel-ubuntu22.04", "recommended_disk_space": 16,
+        }]}))
+        with self.assertRaisesRegex(JobError, "CUDA development template"):
+            client.template(template_hash, Deadline(10))
+
     def test_full_pages_are_followed_even_when_truncated_is_false(self):
         client, session = self.client(
             Response({"offers": [raw_offer(1, gpu_name="RTX 3090"), raw_offer(2, gpu_name="RTX 3090")],

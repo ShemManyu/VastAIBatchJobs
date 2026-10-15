@@ -457,6 +457,15 @@ class SSHTransport:
         command = (
             f"{shlex.quote(interpreter)} {shlex.quote(self.remote_dir + '/remote_job.py')} {stage}"
         )
+        if stage == "bootstrap":
+            command = (
+                "if ! command -v python3 >/dev/null 2>&1; then "
+                "if [ \"$(id -u)\" != 0 ] || ! command -v apt-get >/dev/null 2>&1; then "
+                "printf '%s\\n' 'JobError: Python 3 is missing and cannot be installed.' >&2; exit 1; fi; "
+                "apt-get update -qq </dev/null >&2 && "
+                "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 python3-venv "
+                "</dev/null >&2 || exit 1; fi; " + command
+            )
         encoded = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode()
         if len(encoded) > MAX_WORKER_REQUEST_BYTES:
             raise JobError("Remote request exceeds the 8 MiB protocol limit.")

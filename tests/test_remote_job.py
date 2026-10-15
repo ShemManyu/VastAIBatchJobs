@@ -209,6 +209,37 @@ class WorkerTests(WorkerFixture):
                 bootstrap(self.root, {"gpu_name": "A100"}, Deadline(30))
             setup.assert_not_called()
 
+    def test_bare_cuda_template_installs_venv_before_creating_the_environment(self):
+        commands = []
+
+        def capture(args, root, deadline, context):
+            commands.append(args)
+            if args[:2] == ["cmake", "--build"]:
+                binary = root / "llama.cpp/build/bin/llama-server"
+                binary.parent.mkdir(parents=True)
+                binary.write_text("SYNTHETIC_BINARY_FIXTURE")
+
+        with patch("remote_job.gpu_details", return_value={"gpu_name": "A100"}), \
+             patch("remote_job.shutil.which", return_value="/fixture/tool"), \
+             patch("remote_job.importlib.util.find_spec", return_value=None), \
+             patch("remote_job.os.geteuid", return_value=0), \
+             patch("remote_job.logged_command", side_effect=capture):
+            bootstrap(self.root, {"gpu_name": "A100"}, Deadline(30))
+        install = next(args for args in commands if args[:2] == ["apt-get", "install"])
+        self.assertEqual(install[-1], "python3-venv")
+        environment = next(args for args in commands if "-m" in args and "venv" in args)
+        self.assertLess(commands.index(install), commands.index(environment))
+
+    def test_missing_venv_without_install_privilege_fails_explicitly(self):
+        with patch("remote_job.gpu_details", return_value={"gpu_name": "A100"}), \
+             patch("remote_job.shutil.which", return_value="/fixture/tool"), \
+             patch("remote_job.importlib.util.find_spec", return_value=None), \
+             patch("remote_job.os.geteuid", return_value=1000), \
+             patch("remote_job.logged_command") as commands:
+            with self.assertRaisesRegex(JobError, "Python venv/ensurepip"):
+                bootstrap(self.root, {"gpu_name": "A100"}, Deadline(30))
+            commands.assert_not_called()
+
     def test_server_is_loopback_gpu_only_and_has_explicit_generation_capacity(self):
         args = server_args(Path("/fixture/server"), Path("/fixture/model.gguf"), 4096, 12345)
         self.assertEqual(args[args.index("--host") + 1], "127.0.0.1")

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -99,12 +100,17 @@ def bootstrap(root: Path, request: dict[str, Any], deadline: Deadline) -> dict[s
     if shutil.which("nvcc") is None:
         raise JobError("The template must include the CUDA development toolkit (nvcc).")
     missing = [tool for tool in ("git", "cmake", "g++") if shutil.which(tool) is None]
-    if missing:
+    missing_venv = importlib.util.find_spec("ensurepip") is None
+    if missing or missing_venv:
         if os.geteuid() != 0 or shutil.which("apt-get") is None:
-            raise JobError(f"The CUDA template is missing build tools: {', '.join(missing)}.")
+            prerequisites = missing + (["Python venv/ensurepip"] if missing_venv else [])
+            raise JobError(f"The CUDA template is missing prerequisites: {', '.join(prerequisites)}.")
         logged_command(["apt-get", "update", "-qq"], root, deadline, "Updating build dependencies")
+        packages = ["git", "cmake", "build-essential"] if missing else []
+        if missing_venv:
+            packages.append("python3-venv")
         logged_command(
-            ["apt-get", "install", "-y", "-qq", "git", "cmake", "build-essential"],
+            ["apt-get", "install", "-y", "-qq", *packages],
             root, deadline, "Installing missing build dependencies",
         )
     if request.get("agent") is True:

@@ -5,6 +5,9 @@ import json
 import os
 from pathlib import Path
 import signal
+import shlex
+import subprocess
+import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -678,6 +681,7 @@ class ConfigAndTransportTests(unittest.TestCase):
             self.assertEqual(payload["remaining_seconds"], 20)
             self.assertNotIn(VAST_TOKEN, json.dumps(payload))
             self.assertIn("StrictHostKeyChecking=accept-new", arguments)
+            self.assertNotIn("apt-get", " ".join(arguments))
 
     def test_help_does_not_read_credentials_or_contact_providers(self):
         with patch("run_job.credentials_from_file") as credentials, redirect_stdout(io.StringIO()):
@@ -685,3 +689,75 @@ class ConfigAndTransportTests(unittest.TestCase):
                 main(["--help"])
         self.assertEqual(caught.exception.code, 0)
         credentials.assert_not_called()
+
+    def test_missing_remote_python_bootstrap_keeps_request_stdin_and_stdout_clean(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binaries = root / "bin"
+            binaries.mkdir()
+            state = RunState(root, root, {"run_id": "20261009T000000Z-aaaaaaaaaaaa", "warnings": []},
+                             Credentials(VAST_TOKEN, HF_TOKEN))
+            transport = SSHTransport(state, Endpoint("unit.invalid", 2222))
+            stub = root / "python-stub"
+            handler = (
+                "import json,sys; request=json.load(sys.stdin); "
+                f"print(json.dumps({{'status':'ready','llama_commit':{run_job.LLAMA_COMMIT!r},"
+                "'received':request}))"
+            )
+            stub.write_text(f"#!/bin/sh\nexec {shlex.quote(sys.executable)} -c {shlex.quote(handler)}\n")
+            stub.chmod(0o700)
+            identity = binaries / "id"
+            identity.write_text("#!/bin/sh\nprintf '%s\\n' 0\n")
+            identity.chmod(0o700)
+            installer = binaries / "apt-get"
+            installer.write_text(
+                "#!/bin/sh\nprintf '%s\\n' APT_LOG_MUST_NOT_POLLUTE_JSON\n"
+                "if read unexpected; then exit 91; fi\n"
+                "if [ \"$1\" = install ]; then "
+                f"/bin/cp {shlex.quote(str(stub))} {shlex.quote(str(binaries / 'python3'))} && "
+                f"/bin/chmod 700 {shlex.quote(str(binaries / 'python3'))}; fi\n"
+            )
+            installer.chmod(0o700)
+            observations = []
+
+            def execute(command, deadline, input_data):
+                process = subprocess.run(
+                    ["/bin/sh", "-c", command], input=input_data, capture_output=True,
+                    env={"PATH": str(binaries)}, check=True,
+                )
+                observations.append(process)
+                return process.stdout
+
+            with patch.object(transport, "command", side_effect=execute):
+                result = transport.invoke("bootstrap", {"hf_token": HF_TOKEN}, Clock().deadline(20))
+            self.assertEqual(result["received"]["hf_token"], HF_TOKEN)
+            self.assertEqual(result["received"]["remaining_seconds"], 20)
+            self.assertNotIn(b"APT_LOG", observations[0].stdout)
+            self.assertIn(b"APT_LOG_MUST_NOT_POLLUTE_JSON", observations[0].stderr)
+
+            identity.write_text("#!/bin/sh\nprintf '%s\\n' 1000\n")
+            with patch.object(transport, "command", side_effect=execute):
+                result = transport.invoke("bootstrap", {"hf_token": HF_TOKEN}, Clock().deadline(20))
+            self.assertEqual(result["received"]["hf_token"], HF_TOKEN)
+            self.assertEqual(observations[-1].stderr, b"")
+
+            (binaries / "python3").unlink()
+            with patch.object(transport, "command", side_effect=execute), \
+                 self.assertRaises(subprocess.CalledProcessError) as caught:
+                transport.invoke("bootstrap", {}, Clock().deadline(20))
+            self.assertIn(b"Python 3 is missing and cannot be installed", caught.exception.stderr)
+
+            identity.write_text("#!/bin/sh\nprintf '%s\\n' 0\n")
+            installer.unlink()
+            with patch.object(transport, "command", side_effect=execute), \
+                 self.assertRaises(subprocess.CalledProcessError) as caught:
+                transport.invoke("bootstrap", {}, Clock().deadline(20))
+            self.assertIn(b"Python 3 is missing and cannot be installed", caught.exception.stderr)
+
+            installer.write_text("#!/bin/sh\nexit 37\n")
+            installer.chmod(0o700)
+            with patch.object(transport, "command", side_effect=execute), \
+                 self.assertRaises(subprocess.CalledProcessError) as caught:
+                transport.invoke("bootstrap", {}, Clock().deadline(20))
+            self.assertEqual(caught.exception.stdout, b"")
+            self.assertFalse((binaries / "python3").exists())
