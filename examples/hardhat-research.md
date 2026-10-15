@@ -124,6 +124,7 @@ request signing keys, or use a live network for transaction execution.
      All values must come from the actual results, not invented examples.
    Print only concise metadata: address, contract name, source path, and hashes.
    Do not dump full bytecode, ABI, or the raw Etherscan response into tool output.
+   Use Node's global `fetch`; do not import or install `node-fetch`.
 5. Read the saved Solidity source and balance output. Inspect the contract
    output with a short script that omits `runtime_bytecode`. Never call
    `read_file` on `outputs/contracts.json`, which contains large hex strings.
@@ -140,6 +141,21 @@ request signing keys, or use a live network for transaction execution.
    Include a short exact declaration or condition from the saved source beside
    each access-control claim. Keep each contract's functions in its own section:
    Dai's `wards`, `rely`, `deny`, and `auth` do not exist in LINK or WETH9.
+   Start each contract section with `## CONTRACT_NAME (ADDRESS)`, using its
+   actual verified name and selected address. Include exactly one table with
+   this header:
+   `| Function | Modifiers | Caller conditions | Source declaration |`
+   Cover every named public/external function defined in the source, including
+   inherited functions. Use the final derived override where one exists.
+   Function cells contain plain function names. Modifiers cells contain only
+   the actual named Solidity modifiers, comma-separated, or `none`; visibility,
+   `view`, `constant`, and `returns` are not named modifiers.
+   Quote each exact declaration before its opening `{` in backticks in the last
+   column, collapsing source whitespace onto one line. Explain actual caller
+   conditions in the third column. Escape literal Markdown table pipes as `\|`.
+   Do not invent functions or fill the table from ERC-20/Ownable stereotypes.
+   Read the downloaded source first; the finish verifier compares the table
+   directly with freshly fetched verified declarations and modifiers.
    - For Dai, compare `mint` and `burn` authorization separately, inspect the
      holder/allowance branches, and describe `permit`'s actual approval values.
    - For LINK, inspect the exact `validRecipient` expression and

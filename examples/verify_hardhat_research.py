@@ -65,6 +65,76 @@ def artifact(root: Path, name: object) -> Path:
     return candidate
 
 
+def verify_report_section(summary: str, address: str, contract_name: str, source: str) -> int:
+    headings = list(re.finditer(r"(?m)^##[ \t]+[^\n]+", summary))
+    selected = [index for index, heading in enumerate(headings) if address.lower() in heading[0].lower()]
+    require(len(selected) == 1, f"Report needs one ## {contract_name} ({address}) section.")
+    index = selected[0]
+    require(contract_name.lower() in headings[index][0].lower(), "Report section needs the verified contract name.")
+    end = headings[index + 1].start() if index + 1 < len(headings) else len(summary)
+    section = summary[headings[index].end():end]
+    masked = re.sub(
+        r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|//[^\n]*|/\*.*?\*/',
+        lambda match: " " * len(match[0]), source, flags=re.DOTALL,
+    )
+    declarations: dict[str, tuple[str, set[str], bool]] = {}
+    for match in re.finditer(r"\bfunction\s+([A-Za-z_]\w*)\s*\([^)]*\)\s*([^;{}]*?)\{", masked):
+        name, tail = match[1], match[2]
+        modifiers = set(re.findall(
+            r"[A-Za-z_]\w*", re.sub(r"\([^)]*\)", "", tail),
+        )) - {"public", "external", "private", "internal", "view", "pure", "constant", "payable", "returns"}
+        declarations[name] = (
+            source[match.start():match.end() - 1].strip(), modifiers,
+            not re.search(r"\b(?:private|internal)\b", tail) and name != contract_name,
+        )
+    require(bool(declarations), "Verified source contains no named function definitions.")
+    header = ["function", "modifiers", "caller conditions", "source declaration"]
+    active = False
+    tables = 0
+    observed: set[str] = set()
+    for line in section.splitlines():
+        line = line.strip()
+        if not (line.startswith("|") and line.endswith("|")):
+            active = False
+            continue
+        cells = [cell.strip() for cell in re.split(r"(?<!\\)\|", line)[1:-1]]
+        if [cell.lower() for cell in cells] == header:
+            active = True
+            tables += 1
+            continue
+        if not active:
+            require(not cells or cells[0].lower() != "function", "Use the exact four-column source table header.")
+            continue
+        if all(re.fullmatch(r":?-+:?", cell) for cell in cells):
+            continue
+        require(len(cells) == 4, "Source table needs four columns; escape literal pipes as \\|.")
+        name = cells[0].strip("`")
+        require(name in declarations, f"{contract_name}: reported function {name} does not exist in verified source.")
+        require(name not in observed, f"{contract_name}: duplicate source table row for {name}.")
+        declaration, modifiers, _ = declarations[name]
+        quote = re.fullmatch(r"`([^`]+)`", cells[3])
+        require(quote is not None, f"{contract_name}.{name}: quote the actual source declaration in backticks.")
+        require(
+            re.sub(r"\s+", "", quote[1].rstrip().removesuffix("{")) == re.sub(r"\s+", "", declaration),
+            f"{contract_name}.{name}: declaration differs from verified source; quote {declaration!r}.",
+        )
+        claimed = set(re.split(r"[\s,]+", cells[1].replace("`", "").strip()))
+        if claimed == {"none"}:
+            claimed = set()
+        require(
+            claimed == modifiers,
+            f"{contract_name}.{name}: named modifiers must be {', '.join(sorted(modifiers)) or 'none'}, "
+            "not an assumed owner/auth restriction.",
+        )
+        require(bool(cells[2]), f"{contract_name}.{name}: explain the actual caller conditions.")
+        observed.add(name)
+    required = {name for name, (_, _, public) in declarations.items() if public}
+    require(tables == 1 and required <= observed,
+            f"{contract_name}: source table must cover every named public/external function; "
+            f"missing {', '.join(sorted(required - observed)) or 'a single correctly headed table'}.")
+    return len(observed)
+
+
 def verify(root: Path) -> dict[str, Any]:
     root = root.resolve()
     for name in (
@@ -174,10 +244,12 @@ def verify(root: Path) -> dict[str, Any]:
         require(address.lower() in summary.lower() and source["source_path"] in summary,
                 "Report must cite each selected address and its saved Solidity path.")
         require(any(function in summary for function in functions), "Report cites no observed contract function.")
+        # Agent-writable source additions must not change the declaration checks.
+        report_functions = verify_report_section(summary, address, current["ContractName"], "\n".join(contents))
         verified.append({
             "address": address, "contract_name": current["ContractName"], "balance_wei": row["balance_wei"],
             "runtime_code_bytes": len(code_bytes), "runtime_bytecode_sha256": code_hash,
-            "source_sha256": source_hash,
+            "source_sha256": source_hash, "report_function_count": report_functions,
         })
     return {"status": "verified", "block_number": block, "contracts": verified}
 

@@ -22,6 +22,7 @@ class HardhatVerifierTests(unittest.TestCase):
         self.code = "0x606000"
         self.source = "// SPDX-License-Identifier: MIT\ncontract Example { function transfer() public {} }\n"
         self.original = self.source
+        self.functions = [("transfer", "none", "function transfer() public")]
         self.seed()
         self.environment = patch.dict(os.environ, {
             "ALCHEMY_API_KEY": "FAKE_ALCHEMY_TEST_KEY", "ETHERSCAN_API_KEY": "FAKE_ETHERSCAN_TEST_KEY",
@@ -67,7 +68,15 @@ class HardhatVerifierTests(unittest.TestCase):
                 "source_sha256": hashlib.sha256(self.source.encode()).hexdigest(),
                 "etherscan_response_path": response_path,
             })
-            report.append(f"{address}: transfer() in {source_path}")
+            report.append(
+                f"## Example ({address})\nSource: {source_path}\n\n"
+                "| Function | Modifiers | Caller conditions | Source declaration |\n"
+                "| --- | --- | --- | --- |\n"
+                + "\n".join(
+                    f"| {name} | {modifiers} | Source-defined caller conditions | `{declaration}` |"
+                    for name, modifiers, declaration in self.functions
+                )
+            )
         self.save("outputs/contracts.json", self.contracts)
         (self.root / "report.md").write_text("\n".join(report))
 
@@ -98,7 +107,75 @@ class HardhatVerifierTests(unittest.TestCase):
         self.assertEqual(result["status"], "verified")
         self.assertEqual(len(result["contracts"]), 2)
         self.assertEqual({row["runtime_code_bytes"] for row in result["contracts"]}, {3})
+        self.assertEqual({row["report_function_count"] for row in result["contracts"]}, {1})
         self.assertEqual(self.request.call_count, 7)
+
+    def test_invented_owner_function_is_rejected_despite_correct_chain_and_source_data(self):
+        report = self.root / "report.md"
+        report.write_text(report.read_text().replace(
+            "| transfer | none | Source-defined caller conditions | `function transfer() public` |",
+            "| transferOwnership | onlyOwner | Only the owner | `function transferOwnership() public onlyOwner` |",
+            1,
+        ))
+        with self.assertRaisesRegex(ValueError, "transferOwnership.*does not exist"):
+            verify(self.root)
+
+    def test_burn_cannot_claim_auth_when_its_real_declaration_has_no_modifier(self):
+        self.source = (
+            "// SPDX-License-Identifier: MIT\ncontract Example { "
+            "function transfer() public {} function burn(address usr, uint wad) external {} }\n"
+        )
+        self.original = self.source
+        self.functions.append(("burn", "none", "function burn(address usr, uint wad) external"))
+        self.seed()
+        self.assertEqual(verify(self.root)["status"], "verified")
+        report = self.root / "report.md"
+        report.write_text(report.read_text().replace("| burn | none |", "| burn | auth |", 1))
+        with self.assertRaisesRegex(ValueError, "burn: named modifiers must be none"):
+            verify(self.root)
+
+    def test_quote_must_match_the_real_declaration_not_a_plausible_signature(self):
+        report = self.root / "report.md"
+        report.write_text(report.read_text().replace(
+            "`function transfer() public`", "`function transfer(address to, uint value) public`", 1,
+        ))
+        with self.assertRaisesRegex(ValueError, "declaration differs from verified source"):
+            verify(self.root)
+
+    def test_omitting_a_public_function_is_not_complete_source_evidence(self):
+        self.source = (
+            "// SPDX-License-Identifier: MIT\ncontract Example { "
+            "function transfer() public {} function approve(address guy, uint wad) external {} }\n"
+        )
+        self.original = self.source
+        self.seed()
+        with self.assertRaisesRegex(ValueError, "missing approve"):
+            verify(self.root)
+
+    def test_appended_unverified_declaration_cannot_change_reported_modifiers(self):
+        self.source += "contract Fake { function transfer() public auth {} }\n"
+        self.functions = [("transfer", "auth", "function transfer() public auth")]
+        self.seed()
+        with self.assertRaisesRegex(ValueError, "declaration differs from verified source"):
+            verify(self.root)
+
+    def test_flattened_override_uses_the_derived_declaration_and_named_modifier(self):
+        self.source = (
+            "// SPDX-License-Identifier: MIT\n"
+            "contract Base { function transfer() public {} }\n"
+            "contract Example is Base { modifier validRecipient { _; } "
+            "function transfer() public validRecipient {} }\n"
+        )
+        self.original = self.source
+        self.functions = [("transfer", "validRecipient", "function transfer() public validRecipient")]
+        self.seed()
+        self.assertEqual(verify(self.root)["status"], "verified")
+        report = self.root / "report.md"
+        report.write_text(report.read_text().replace(
+            "| transfer | validRecipient |", "| transfer | none |", 1,
+        ))
+        with self.assertRaisesRegex(ValueError, "named modifiers must be validRecipient"):
+            verify(self.root)
 
     def test_hex_character_length_and_incorrect_balance_are_rejected(self):
         for field, incorrect in (("fork_code_bytes", len(self.code)), ("balance_wei", "101")):

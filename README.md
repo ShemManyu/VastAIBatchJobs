@@ -68,14 +68,14 @@ python run_job.py agent \
   --timeout-minutes 45 \
   --context-size 65536 \
   --max-steps 40 \
-  --max-tokens 3072
+  --max-tokens 4096
 ```
 
 This is a paid run. Add `--dry-run` to inspect the model/template/offer without executing actions or renting an instance. The supplied [Hardhat task](examples/hardhat-research.md) instructs the agent to create and execute its own scripts on a local Ethereum mainnet fork, read native ETH balances for two randomly sampled verified contracts, fetch deployed bytecode through Alchemy, obtain verified Solidity through Etherscan, and write a source-grounded report. **Alchemy `eth_getCode` returns bytecode, not verified Solidity.** No transactions, deployment, or wallet credentials are needed.
 
 The agent example uses a dense 32B coding model with an approximately 19.9 GB Q4 download. Prefer an 80 GB A100 for the larger context. Earlier 8B and 30B/3B-active MoE attempts did not complete this scenario reliably: they guessed dependencies, omitted required configuration, or made unsupported report claims. Model completion is not a correctness guarantee; inspect the returned execution and source evidence.
 
-The research example uses a 65,536-token context because retained script/tool/source history exceeded 32,768 tokens in a real attempt. The workflow fails explicitly instead of silently discarding evidence when history plus reserved output exceeds the limit. Keep metadata output compact, avoid dumping bytecode/ABI, and choose context capacity supported by both the model and GPU.
+The research example uses a 65,536-token context because retained script/tool/source history exceeded 32,768 tokens in a real attempt. It reserves 4,096 output tokens per decision so the source-evidence report tables fit. The workflow fails explicitly instead of silently discarding evidence when history plus reserved output exceeds the limit. Keep metadata output compact, avoid dumping bytecode/ABI, and choose context capacity supported by both the model and GPU.
 
 Add `ALCHEMY_API_KEY` and `ETHERSCAN_API_KEY` to the selected `.env` for this example. Each `--agent-env NAME` forwards only that named variable to command processes over SSH stdin. Process-environment precedence is unchanged. Missing/empty selected variables fail before rental. The VastAI/Hugging Face credentials and identity/interpreter variables cannot be forwarded this way. Values are not included in model messages or metadata.
 
@@ -97,7 +97,7 @@ Other instance/model/output defaults match `run`. Input snapshots are limited to
 
 `--verify-script` snapshots a trusted, nonempty standard-library Python script of at most 16 KiB before rental, matching the tool's per-argument byte limit. It runs remotely in the workspace with the same non-root identity, approved task variables, and tool limits whenever the model requests `finish`. A nonzero exit, timeout, or tool error rejects finish and returns the observation to the model for correction. The immutable script text is sent through SSH stdin, not copied into the agent-writable workspace or exposed as a local process argument; metadata records its SHA-256. It is not executed on your Mac. Relative paths resolve against the caller's directory.
 
-The supplied verifier checks the Hardhat task's exact contract count, decoded byte lengths, same-block balances/bytecode, hashes, preserved verified source, and report references against fresh API reads. It does not grade subjective reasoning or prove arbitrary generated code safe. Without a verifier, completion means the model finished and artifacts were retrieved, not that every task claim was independently confirmed.
+The supplied verifier checks the Hardhat task's exact contract count, decoded byte lengths, same-block balances/bytecode, hashes, preserved verified source, and report references against fresh API reads. Each contract's report table must quote its real function declarations and match their named modifiers, including inherited overrides; invented ownership functions and a false `auth` claim on Dai's `burn` are rejected. These checks are tailored to the included legacy-contract pool, not a general Solidity parser. Prose reasoning and caller-condition explanations still need direct review, and the verifier does not prove arbitrary generated code safe. Without a verifier, completion means the model finished and artifacts were retrieved, not that every task claim was independently confirmed.
 
 Commands run as a dedicated non-root Linux user with cleared groups/capabilities, no-new-privileges, a clean environment, resource limits, and a private workspace/home. Standard output and error are each bounded to 16 KiB; truncation is explicit. Remaining processes owned by that identity are killed after each action, so background services are not preserved. The model server uses a private API-key file unavailable to tool processes. **This is not a full hostile-code sandbox or an egress firewall.** Tools have internet access and can use approved task keys; trust the task, dependencies, scripts, and rented host. No local filesystem is mounted.
 
