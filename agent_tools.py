@@ -182,6 +182,16 @@ def execute(
     raise ToolError("Unknown action; use run, read_file, write_file, or list_files.")
 
 
+def configure_limits(timeout: float) -> None:
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    resource.setrlimit(resource.RLIMIT_NOFILE, (4096, 4096))
+    resource.setrlimit(resource.RLIMIT_NPROC, (64, 64))
+    # V8 reserves several GiB of virtual address space even for a small heap.
+    resource.setrlimit(resource.RLIMIT_AS, (16 * 1024 ** 3, 16 * 1024 ** 3))
+    resource.setrlimit(resource.RLIMIT_FSIZE, (64 * 1024 ** 2, 64 * 1024 ** 2))
+    resource.setrlimit(resource.RLIMIT_CPU, (math.ceil(timeout) + 1, math.ceil(timeout) + 1))
+
+
 def main() -> int:
     sandbox_verified = False
     try:
@@ -201,13 +211,7 @@ def main() -> int:
         timeout = request["timeout"]
         if not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or not 0 < timeout <= 600:
             raise ToolError("Tool timeout is invalid.")
-        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-        resource.setrlimit(resource.RLIMIT_NOFILE, (128, 128))
-        resource.setrlimit(resource.RLIMIT_NPROC, (64, 64))
-        # V8 reserves several GiB of virtual address space even for a small heap.
-        resource.setrlimit(resource.RLIMIT_AS, (16 * 1024 ** 3, 16 * 1024 ** 3))
-        resource.setrlimit(resource.RLIMIT_FSIZE, (64 * 1024 ** 2, 64 * 1024 ** 2))
-        resource.setrlimit(resource.RLIMIT_CPU, (math.ceil(timeout) + 1, math.ceil(timeout) + 1))
+        configure_limits(timeout)
         result = execute(
             Path(request["workspace"]), request["action"], timeout=timeout,
             maximum=request["max_output_bytes"],

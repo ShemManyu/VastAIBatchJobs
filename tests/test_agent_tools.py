@@ -97,6 +97,27 @@ class ToolTests(unittest.TestCase):
         self.assertNotEqual(result["exit_code"], 0)
         self.assertLess(time.monotonic() - start, 3)
 
+    def test_tool_file_descriptor_budget_supports_real_dependency_manager_concurrency(self):
+        (self.root / "payload").write_text("data")
+        code = (
+            "import resource, sys\n"
+            "from unittest.mock import patch\n"
+            "sys.path.insert(0, " + repr(str(Path(__file__).resolve().parents[1])) + ")\n"
+            "from agent_tools import configure_limits\n"
+            "setrlimit = resource.setrlimit\n"
+            "def set_only_fd_limit(kind, limits):\n"
+            "    if kind == resource.RLIMIT_NOFILE:\n"
+            "        setrlimit(kind, limits)\n"
+            "with patch('agent_tools.resource.setrlimit', side_effect=set_only_fd_limit):\n"
+            "    configure_limits(10)\n"
+            "handles = [open('payload') for _ in range(512)]\n"
+            "print(len(handles))\n"
+            "[handle.close() for handle in handles]\n"
+        )
+        result = execute(self.root, {"action": "run", "argv": [sys.executable, "-c", code]})
+        self.assertEqual(result["exit_code"], 0, result["stderr"])
+        self.assertEqual(result["stdout"], "512\n")
+
     def test_invalid_actions_limits_and_obfuscated_shell_expansions_fail(self):
         for action in (
             {"action": "unknown"}, {"action": "run", "argv": "echo bad"},

@@ -157,6 +157,19 @@ class AgentLoopTests(unittest.TestCase):
         transcript = json.loads((self.root / "agent-transcript.json").read_text())
         self.assertEqual(transcript["steps"][2]["observation"]["stdout"], "42\n")
 
+    def test_five_consecutive_failures_stop_exactly_and_preserve_recovery_evidence(self):
+        report = self.run_actions([
+            {"action": "run", "argv": [sys.executable, "-c", "import sys; sys.exit(7)"]}
+            for _ in range(5)
+        ])
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["steps"], 5)
+        self.assertEqual(len(self.model_requests), 5)
+        self.assertEqual(len(self.sandbox.actions), 5)
+        transcript = json.loads((self.root / "agent-transcript.json").read_text())
+        self.assertIn("recovery_hint", transcript["steps"][2]["observation"])
+        self.assertFalse((self.root / "response.txt").exists())
+
     def test_step_limit_is_exact_and_preserves_partial_scripts_and_execution_evidence(self):
         report = self.run_actions([
             {"action": "write_file", "path": "partial.py", "content": "print(7)\n"},

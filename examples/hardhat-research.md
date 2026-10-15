@@ -20,6 +20,10 @@ request signing keys, or use a live network for transaction execution.
 - Install these compatible pins locally: `hardhat@2.29.1`,
   `@nomicfoundation/hardhat-ethers@3.1.3`, and `ethers@6.17.0`.
   Use npm's `--no-audit --no-fund` options to keep output small.
+- Do not install an upgrades plugin, toolbox, or OpenZeppelin package. This
+  read-only task needs only the three specified packages. If an import fails,
+  inspect the config/script and remove an unnecessary import instead of
+  guessing other package names or versions.
 
 ## Required actions
 
@@ -28,6 +32,8 @@ request signing keys, or use a live network for transaction execution.
    `defaultNetwork` to `hardhat`, and configure `networks.hardhat.forking.url`
    from the Alchemy environment key. Set `networks.hardhat.accounts` to `[]`.
    No Solidity compilation is necessary.
+   The config must use `require("@nomicfoundation/hardhat-ethers")`; do not
+   substitute a bare `require("ethers")` for loading the Hardhat plugin.
 2. Create `scripts/read-balances.cjs`. Randomly sample two different addresses
    from this pool of known non-proxy, verified mainnet contracts:
    - WETH9: `0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2`

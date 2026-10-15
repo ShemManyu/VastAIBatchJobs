@@ -79,6 +79,9 @@ Python 3, Node 22, npm, and internet access are available. Install npm dependenc
 You are not root. Do not try sudo, inspect other users, access worker/model files, or escalate privileges.
 File tools only allow relative workspace paths without symlinks or directory traversal.
 The observation after each action is the actual tool result. Check exit codes and fix failures.
+After a failed command, inspect the relevant files and diagnose its cause before retrying.
+Do not repeatedly guess package names or versions. Follow dependency versions given in the task;
+remove an unnecessary import instead of installing unrelated or nonexistent packages.
 Never claim a script ran successfully unless its run observation confirms it.
 Keep useful scripts, outputs, source evidence, and a report in the workspace.
 Dependency/cache directories are excluded from returned artifacts.
@@ -377,6 +380,7 @@ def run_agent(
         "final_response": None, "archive": None,
     }
     archive_info: dict[str, Any] | None = None
+    consecutive_failures = 0
     try:
         for step in range(1, options.max_steps + 1):
             actions_deadline.remaining()
@@ -407,8 +411,20 @@ def run_agent(
                     break
             else:
                 observation = sandbox.execute(action, actions_deadline)
+            failed = (
+                "error" in observation or observation.get("timed_out") is True
+                or ("exit_code" in observation and observation["exit_code"] != 0)
+            )
+            consecutive_failures = consecutive_failures + 1 if failed else 0
+            if consecutive_failures >= 3:
+                observation["recovery_hint"] = (
+                    "Repeated failures: inspect the actual error and relevant files. "
+                    "Recheck the task; do not keep guessing unrelated packages or versions."
+                )
             record["observation"] = observation
             write_json(root / "agent-transcript.json", scrub_values(transcript, secrets))
+            if consecutive_failures >= 5:
+                raise JobError("Agent could not recover from five consecutive tool failures.")
             messages.append({"role": "assistant", "content": completion_text(completion)})
             messages.append({
                 "role": "user",
