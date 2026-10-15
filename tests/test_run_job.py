@@ -98,8 +98,34 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual([call.kwargs["gpu_count"] for call in search.call_args_list], [8, 8])
         self.assertEqual(state.data["settings"]["gpu_count"], 8)
         self.assertEqual(state.data["offer"]["gpu_count"], 8)
+        self.assertEqual(state.data["remote_gpu"]["gpu_count"], 8)
+        self.assertEqual(state.data["remote_gpu"]["gpu_vram_total_mib"], 327680)
+        self.assertEqual(len(state.data["remote_gpu"]["gpus"]), 8)
         self.assertEqual([payload["gpu_count"] for _, payload in self.transports[-1].requests], [8, 8])
         self.assertFalse(client.exists)
+
+    def test_unconfirmed_or_inconsistent_multi_gpu_inventory_fails_with_cleanup(self):
+        original = FakeTransport.invoke
+        for malformed in (
+            {"gpu_count": 4},
+            {"gpus": []},
+            {"gpu_vram_total_mib": 40960},
+            {"gpus": [{"gpu_name": "RTX 3090", "gpu_vram_mib": 40960}] * 8},
+        ):
+            with self.subTest(malformed=malformed):
+                client = FakeClient()
+                client.offer = replace(client.offer, gpu_count=8)
+
+                def forged(transport, stage, request, deadline):
+                    report = original(transport, stage, request, deadline)
+                    if stage == "infer":
+                        report.update(malformed)
+                    return report
+
+                with patch.object(FakeTransport, "invoke", forged), self.assertRaises(JobError):
+                    self.execute(client, settings=replace(self.settings, gpu_count=8))
+                self.assertEqual(client.destroyed, 1)
+                self.assertFalse(client.exists)
 
     def test_changed_gpu_count_or_insufficient_aggregate_weights_capacity_cannot_be_rented(self):
         from run_job import select_offer

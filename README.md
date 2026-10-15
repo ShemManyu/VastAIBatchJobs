@@ -66,7 +66,7 @@ python run_job.py agent \
   --gpu-count 8 \
   --max-hourly-price 7.52 \
   --max-bandwidth-price 0.015625 \
-  --timeout-minutes 43 \
+  --timeout-minutes 60 \
   --disk-gb 400 \
   --context-size 65536 \
   --max-steps 40 \
@@ -77,7 +77,9 @@ This is a paid run. Add `--dry-run` to inspect the model/template/offer without 
 
 The larger agent example uses Qwen3-Coder-480B-A35B, a 480B-total/35B-active mixture-of-experts model, with approximately 207 GB of Q3_K_S GGUF weights across five files. It requires a multi-GPU instance such as eight 40 GB A100s. Active parameters do not reduce the memory needed to fully offload all model weights. This lower-precision choice reduces download cost versus its approximately 290 GB Q4_K_M set, but model size and quantization do not guarantee reasoning accuracy. Earlier 8B, 30B/3B-active MoE, and 32B coder attempts did not complete this scenario reliably; inspect actual execution and source evidence.
 
-At an observed eight-A100 quote of $7.5126/hour and $0.015625/GB ingress, the Q3_K_S weights cost approximately $3.23 to download. The 43-minute job deadline plus five-minute cleanup costs approximately $6.01 at that hourly quote, before other traffic and billing updates. This is a cost estimate, not an invoice guarantee; recheck the dry-run quote and obtain approval before renting.
+At an observed eight-A100 quote of $7.5126/hour and $0.015625/GB ingress, the Q3_K_S weights cost approximately $3.23 to download. The 60-minute example deadline plus five-minute cleanup costs approximately $8.14 at that hourly quote, before other traffic and billing updates. This is a cost estimate, not an invoice guarantee; recheck the dry-run quote and obtain sufficient approval before renting.
+
+The real 480B test verified all five shards, all eight A100s, 63/63 GPU-offloaded layers and actual 65,536-token serving capacity. However, cold setup/download/loading consumed nearly the entire 43-minute budgeted run: the agent completed only its `package.json` write and began `npm install` before timing out. No research scripts or report were produced. Partial evidence was retrieved and instance destruction independently confirmed. Recorded charges were $8.891 when checked, subject to updates. This is a successful model-loading check, **not a successful Hardhat research result**; the longer example timeout needs a separately approved larger budget.
 
 The research example uses a 65,536-token context because retained script/tool/source history exceeded 32,768 tokens in a real attempt. It reserves 4,096 output tokens per decision so the source-evidence report tables fit. The pinned server caps usable slots to the GGUF's training context even if `--context-size` requests more; the worker checks `/props` after startup and fails before generation if the actual single-slot capacity is smaller. Increasing the allocation alone did not extend the tested Qwen2.5-Coder model's 32,768-token limit. The workflow also fails explicitly instead of silently discarding evidence when history plus reserved output exceeds the verified limit. Keep metadata output compact, avoid dumping bytecode/ABI, and choose context capacity supported by both the model and GPU.
 

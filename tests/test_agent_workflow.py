@@ -240,6 +240,18 @@ class AgentWorkflowTests(unittest.TestCase):
         self.assertFalse((output / "response.txt").exists())
         self.assertEqual(client.destroyed, 1)
 
+    def test_primary_agent_failure_is_not_replaced_by_artifact_retrieval_failure(self):
+        client = FakeClient()
+        with patch("run_job.retrieve_agent", side_effect=JobError("synthetic artifact transfer failure")):
+            with self.assertRaisesRegex(JobError, "Remote agent failed"):
+                self.run_workflow(client, fail="agent-failed")
+        metadata, _ = self.latest()
+        self.assertIn("Remote agent failed", metadata["error"])
+        self.assertNotIn("synthetic artifact transfer failure", metadata["error"])
+        self.assertTrue(any("synthetic artifact transfer failure" in item for item in metadata["warnings"]))
+        self.assertEqual(client.destroyed, 1)
+        self.assertFalse(client.exists)
+
     def test_cleanup_failure_preserves_all_agent_artifacts_and_requires_recovery(self):
         client = FakeClient(fail="cleanup")
         with self.assertRaises(JobError):

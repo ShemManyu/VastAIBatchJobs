@@ -175,6 +175,13 @@ class FakeTransport(SSHTransport):
             "llama_commit": LLAMA_COMMIT, "gpu_name": "NVIDIA A100-SXM4-40GB",
             "gpu_vram_mib": 40960,
         }
+        if request.get("gpu_count", 1) > 1:
+            count = request["gpu_count"]
+            result.update({
+                "gpu_count": count, "gpu_vram_total_mib": 40960 * count,
+                "gpus": [{"gpu_name": "NVIDIA A100-SXM4-40GB", "gpu_vram_mib": 40960}
+                         for _ in range(count)],
+            })
         if stage == "infer":
             completion = {
                 "choices": [{"message": {"role": "assistant", "content": ANSWER},

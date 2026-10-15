@@ -878,12 +878,30 @@ def run_workflow(
         if not isinstance(gpu_name, str) or not gpu_name.strip() or gpu_memory < 24_000:
             raise JobError("Remote worker did not report a valid >=24 GB NVIDIA GPU.")
         state.data["remote_gpu"] = {"gpu_name": gpu_name, "gpu_vram_mib": gpu_memory}
+        if settings.gpu_count > 1:
+            count = positive_int(report.get("gpu_count"), "Reported GPU count")
+            devices = report.get("gpus")
+            if count != settings.gpu_count or not isinstance(devices, list) or len(devices) != count:
+                raise JobError("Remote worker did not confirm every selected GPU.")
+            checked = []
+            for item in devices:
+                device = object_value(item, "Reported GPU")
+                memory = number(device.get("gpu_vram_mib"), "Reported per-GPU VRAM", positive=True)
+                if device.get("gpu_name") != gpu_name or memory < 24_000:
+                    raise JobError("Remote GPU inventory does not match the selected homogeneous GPU group.")
+                checked.append({"gpu_name": gpu_name, "gpu_vram_mib": memory})
+            total_memory = number(report.get("gpu_vram_total_mib"), "Reported total GPU VRAM", positive=True)
+            if total_memory != sum(item["gpu_vram_mib"] for item in checked):
+                raise JobError("Remote aggregate GPU VRAM does not match the per-device inventory.")
+            state.data["remote_gpu"].update({
+                "gpu_count": count, "gpu_vram_total_mib": total_memory, "gpus": checked,
+            })
+        if settings.agent is not None and report["status"] == "failed":
+            raise JobError("Remote agent failed: " + str(report["error"]))
         state.log("Retrieving and validating agent outputs." if settings.agent is not None
                   else "Retrieving and validating the model response.")
         if settings.agent is not None:
             retrieve_agent(transport, state, settings.agent, deadline, report)
-            if report["status"] == "failed":
-                raise JobError("Remote agent failed: " + str(report["error"]))
         else:
             retrieve(transport, state, report, deadline)
         try:
