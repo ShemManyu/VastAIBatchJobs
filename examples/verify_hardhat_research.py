@@ -78,6 +78,7 @@ def verify_report_section(summary: str, address: str, contract_name: str, source
         lambda match: " " * len(match[0]), source, flags=re.DOTALL,
     )
     declarations: dict[str, tuple[str, set[str], bool]] = {}
+    self_funded: set[str] = set()
     for match in re.finditer(r"\bfunction\s+([A-Za-z_]\w*)\s*\([^)]*\)\s*([^;{}]*?)\{", masked):
         name, tail = match[1], match[2]
         modifiers = set(re.findall(
@@ -87,6 +88,12 @@ def verify_report_section(summary: str, address: str, contract_name: str, source
             source[match.start():match.end() - 1].strip(), modifiers,
             not re.search(r"\b(?:private|internal)\b", tail) and name != contract_name,
         )
+        self_funded.discard(name)
+        body = masked[match.end():masked.find("}", match.end())]
+        if contract_name in {"Dai", "WETH9"} and not modifiers and re.fullmatch(
+            r"\s*(?:return\s+)?transferFrom\(\s*msg\.sender\s*,\s*\w+\s*,\s*wad\s*\)\s*;\s*", body,
+        ):
+            self_funded.add(name)
     require(bool(declarations), "Verified source contains no named function definitions.")
     header = ["function", "modifiers", "caller conditions", "source declaration"]
     active = False
@@ -127,6 +134,12 @@ def verify_report_section(summary: str, address: str, contract_name: str, source
             "not an assumed owner/auth restriction.",
         )
         require(bool(cells[2]), f"{contract_name}.{name}: explain the actual caller conditions.")
+        if name in self_funded:
+            require(
+                re.sub(r"\s+", "", cells[2].replace("`", "")) == "balanceOf[msg.sender]>=wad",
+                f"{contract_name}.{name}: self-funded transfer skips allowance; "
+                "use caller condition balanceOf[msg.sender] >= wad.",
+            )
         observed.add(name)
     required = {name for name, (_, _, public) in declarations.items() if public}
     require(tables == 1 and required <= observed,

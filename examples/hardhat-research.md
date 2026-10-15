@@ -166,6 +166,10 @@ request signing keys, or use a live network for transaction execution.
    Quote each exact declaration before its opening `{` in backticks in the last
    column, collapsing source whitespace onto one line. Explain actual caller
    conditions in the third column. Escape literal Markdown table pipes as `\|`.
+   For Dai `transfer`/`push` and WETH9 `transfer`, use the canonical caller
+   condition `balanceOf[msg.sender] >= wad`. These pass `msg.sender` as source
+   to `transferFrom`, so recipient allowance is never a condition. The verifier
+   checks that source call before enforcing this formula for the known pool.
    Do not invent functions or fill the table from ERC-20/Ownable stereotypes.
    Read the downloaded source first; the finish verifier compares the table
    directly with freshly fetched verified declarations and modifiers.

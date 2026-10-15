@@ -7,7 +7,60 @@ import unittest
 from unittest.mock import patch
 import urllib.parse
 
-from examples.verify_hardhat_research import PINS, verify
+from agent_utils import MAX_VERIFICATION_BYTES
+from examples.verify_hardhat_research import PINS, verify, verify_report_section
+
+
+class SelfTransferConditionTests(unittest.TestCase):
+    address = "0x6B175474E89094C44Da98b954EedeAC495271d0F"
+
+    def report(self, contract, name, modifiers, condition, declaration):
+        return (
+            f"## {contract} ({self.address})\n\n"
+            "| Function | Modifiers | Caller conditions | Source declaration |\n"
+            "| --- | --- | --- | --- |\n"
+            f"| {name} | {modifiers} | {condition} | `{declaration}` |\n"
+        )
+
+    def test_actual_self_funded_calls_require_balance_but_never_recipient_allowance(self):
+        for contract, name, recipient in (("Dai", "transfer", "dst"), ("Dai", "push", "usr"),
+                                          ("WETH9", "transfer", "dst")):
+            declaration = f"function {name}(address {recipient}, uint wad) public"
+            source = declaration + f" {{ transferFrom(msg.sender, {recipient}, wad); }}"
+            condition = "balanceOf[msg.sender] >= wad"
+            with self.subTest(contract=contract, name=name):
+                self.assertEqual(verify_report_section(
+                    self.report(contract, name, "none", condition, declaration),
+                    self.address, contract, source,
+                ), 1)
+                for invalid in (
+                    "none", f"allowance[msg.sender][{recipient}] >= wad",
+                    condition + f" and allowance[msg.sender][{recipient}] >= wad",
+                ):
+                    with self.assertRaisesRegex(ValueError, "self-funded transfer skips allowance"):
+                        verify_report_section(
+                            self.report(contract, name, "none", invalid, declaration),
+                            self.address, contract, source,
+                        )
+
+    def test_other_contracts_delegated_calls_and_extra_modifiers_are_not_assumed_self_funded(self):
+        for contract, modifiers, call in (
+            ("Example", "none", "transferFrom(msg.sender, dst, wad)"),
+            ("Dai", "none", "transferFrom(src, dst, wad)"),
+            ("Dai", "auth", "transferFrom(msg.sender, dst, wad)"),
+        ):
+            declaration = "function transfer(address src, address dst, uint wad) public"
+            if modifiers != "none":
+                declaration += " " + modifiers
+            source = declaration + " { return " + call + "; }"
+            self.assertEqual(verify_report_section(
+                self.report(contract, "transfer", modifiers, "Source-defined conditions", declaration),
+                self.address, contract, source,
+            ), 1)
+
+    def test_published_verifier_still_fits_the_real_snapshot_and_argv_limit(self):
+        path = Path(__file__).resolve().parents[1] / "examples/verify_hardhat_research.py"
+        self.assertLessEqual(path.stat().st_size, MAX_VERIFICATION_BYTES)
 
 
 class HardhatVerifierTests(unittest.TestCase):
