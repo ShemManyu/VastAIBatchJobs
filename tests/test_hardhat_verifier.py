@@ -109,6 +109,31 @@ class HardhatVerifierTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     verify(self.root)
 
+    def test_rpc_hex_balance_reports_the_required_decimal_conversion(self):
+        self.balances["contracts"][0]["balance_wei"] = "0x64"
+        self.save("outputs/balances.json", self.balances)
+        with self.assertRaisesRegex(ValueError, "decimal wei string.*BigInt"):
+            verify(self.root)
+        self.assertEqual(self.request.call_count, 1)
+
+    def test_even_exact_numeric_eth_values_require_formatted_strings(self):
+        first = self.balances["contracts"][0]
+        first["balance_wei"] = "0"
+        first["balance_eth"] = 0
+        self.save("outputs/balances.json", self.balances)
+
+        def zero_balance(url, body=None):
+            if body and body.get("method") == "eth_getBalance" and body["params"][0] == first["address"]:
+                return {"result": "0x0"}
+            return self.response(url, body)
+
+        self.request.side_effect = zero_balance
+        with self.assertRaises(ValueError):
+            verify(self.root)
+        first["balance_eth"] = "0.0"
+        self.save("outputs/balances.json", self.balances)
+        self.assertEqual(verify(self.root)["status"], "verified")
+
     def test_placeholder_solidity_is_rejected_even_when_its_declared_hash_is_correct(self):
         path = self.root / self.contracts["contracts"][0]["source_path"]
         path.write_text("contract Placeholder { function transfer() public {} }\n")

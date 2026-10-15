@@ -116,6 +116,16 @@ def verify(root: Path) -> dict[str, Any]:
     for row in selected:
         address = row["address"]
         source = source_rows[address.lower()]
+        require(
+            isinstance(row.get("balance_wei"), str)
+            and re.fullmatch(r"0|[1-9][0-9]*", row["balance_wei"]) is not None,
+            "balance_wei must be a decimal wei string, not RPC hex or a Number; use BigInt(value).toString().",
+        )
+        require(
+            isinstance(row.get("balance_eth"), str)
+            and re.fullmatch(r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?", row["balance_eth"]) is not None,
+            "balance_eth must be a formatted decimal string; use ethers.formatEther(balance), not Number arithmetic.",
+        )
         code = rpc("eth_getCode", [address, hex(block)])
         balance = rpc("eth_getBalance", [address, hex(block)])
         require(isinstance(code, str) and re.fullmatch(r"0x(?:[0-9a-fA-F]{2})+", code) is not None,

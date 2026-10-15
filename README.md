@@ -56,8 +56,8 @@ For a longer or sensitive prompt, create a UTF-8 file and use `--prompt-file ./r
 
 ```bash
 python run_job.py agent \
-  --model-repo unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF \
-  --model-file Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf \
+  --model-repo bartowski/Qwen2.5-Coder-32B-Instruct-GGUF \
+  --model-file Qwen2.5-Coder-32B-Instruct-Q4_K_M.gguf \
   --prompt-file ./examples/hardhat-research.md \
   --verify-script ./examples/verify_hardhat_research.py \
   --agent-env ALCHEMY_API_KEY \
@@ -65,14 +65,15 @@ python run_job.py agent \
   --gpu-policy a100-only \
   --max-hourly-price 1 \
   --max-bandwidth-price 0.01 \
-  --timeout-minutes 30 \
+  --timeout-minutes 45 \
   --context-size 65536 \
+  --max-steps 40 \
   --max-tokens 3072
 ```
 
 This is a paid run. Add `--dry-run` to inspect the model/template/offer without executing actions or renting an instance. The supplied [Hardhat task](examples/hardhat-research.md) instructs the agent to create and execute its own scripts on a local Ethereum mainnet fork, read native ETH balances for two randomly sampled verified contracts, fetch deployed bytecode through Alchemy, obtain verified Solidity through Etherscan, and write a source-grounded report. **Alchemy `eth_getCode` returns bytecode, not verified Solidity.** No transactions, deployment, or wallet credentials are needed.
 
-The agent example uses a coding-specialized 30B mixture-of-experts model with approximately 3B active parameters, an 18.6 GB Q4 download, and a recommended 40 GB A100. The small 8B model used for the single-response smoke test is not a guarantee of reliable multi-step coding: its first agent attempt repeatedly guessed nonexistent packages. Choose a coding-capable model and inspect the returned evidence.
+The agent example uses a dense 32B coding model with an approximately 19.9 GB Q4 download. Prefer an 80 GB A100 for the larger context. Earlier 8B and 30B/3B-active MoE attempts did not complete this scenario reliably: they guessed dependencies, omitted required configuration, or made unsupported report claims. Model completion is not a correctness guarantee; inspect the returned execution and source evidence.
 
 The research example uses a 65,536-token context because retained script/tool/source history exceeded 32,768 tokens in a real attempt. The workflow fails explicitly instead of silently discarding evidence when history plus reserved output exceeds the limit. Keep metadata output compact, avoid dumping bytecode/ABI, and choose context capacity supported by both the model and GPU.
 

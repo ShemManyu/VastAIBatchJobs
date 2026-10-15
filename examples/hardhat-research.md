@@ -36,6 +36,14 @@ request signing keys, or use a live network for transaction execution.
    No Solidity compilation is necessary.
    The config must use `require("@nomicfoundation/hardhat-ethers")`; do not
    substitute a bare `require("ethers")` for loading the Hardhat plugin.
+   Begin the config with this exact plugin-loading statement:
+   ```js
+   require("@nomicfoundation/hardhat-ethers");
+   ```
+   If `ethers` or `ethers.provider` is undefined, inspect the config and add the
+   missing plugin load. Rewriting the balance script without fixing the config
+   does not load the plugin. Never replace the required Hardhat fork with direct
+   Alchemy balance calls or merely label mainnet RPC results as chain 31337.
    Set `paths.cache` to `.cache/hardhat` so fork caches are excluded from
    returned artifacts. Create output directories before writing results.
 2. Create `scripts/read-balances.cjs`. Randomly sample two different addresses
@@ -47,6 +55,9 @@ request signing keys, or use a live network for transaction execution.
    deployed code for both selected addresses. Use Hardhat's ethers provider to
    read their native ETH balances on the fork and its block number. Record
    balances as decimal wei strings and formatted ETH strings.
+   Import `const { ethers } = require("hardhat")` in this script. Use
+   `balance.toString()` for wei and `ethers.formatEther(balance)` for ETH;
+   never use `Number`, `parseInt`, or floating-point division for ETH amounts.
    Record deployed code length in **bytes**, using `(code.length - 2) / 2`
    or `Buffer.from(code.slice(2), "hex").length`, not `code.length`.
 3. Execute the script with
@@ -66,6 +77,8 @@ request signing keys, or use a live network for transaction execution.
    ```
    Replace all placeholders with observed values; there must be two contracts.
    A zero ETH balance is valid, but empty contract code is not.
+   Keep the same sampled addresses while correcting an error. Do not resample
+   as a response to a format/API/report failure.
 4. Create and execute `scripts/fetch-sources.cjs` with
    `node scripts/fetch-sources.cjs`. Read the selected addresses
    and fork block from `outputs/balances.json`. For each address:
@@ -112,8 +125,9 @@ request signing keys, or use a live network for transaction execution.
    Print only concise metadata: address, contract name, source path, and hashes.
    Do not dump full bytecode, ABI, or the raw Etherscan response into tool output.
 5. Read the saved Solidity source and balance output. Inspect the contract
-   output with a short script that omits `runtime_bytecode`, rather than loading
-   large hex strings into the conversation. Write `report.md`
+   output with a short script that omits `runtime_bytecode`. Never call
+   `read_file` on `outputs/contracts.json`, which contains large hex strings.
+   Write `report.md`
    summarizing each contract's purpose, key functions, state transitions,
    balance/allowance handling, and administrative/access-control behavior.
    Cite the saved source file and actual function names for each explanation.
@@ -123,6 +137,9 @@ request signing keys, or use a live network for transaction execution.
    program is unnecessary. Include a short access-control table listing
    sensitive functions, their actual modifiers, and their caller conditions.
    Inspect each individual declaration/body, not ERC-20 stereotypes:
+   Include a short exact declaration or condition from the saved source beside
+   each access-control claim. Keep each contract's functions in its own section:
+   Dai's `wards`, `rely`, `deny`, and `auth` do not exist in LINK or WETH9.
    - For Dai, compare `mint` and `burn` authorization separately, inspect the
      holder/allowance branches, and describe `permit`'s actual approval values.
    - For LINK, inspect the exact `validRecipient` expression and
