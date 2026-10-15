@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 import signal
 import socket
 import subprocess
 import sys
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Iterator
 
 from job_utils import (
     Deadline, DeadlineExceeded, JobError, LLAMA_COMMIT, MAX_WORKER_REQUEST_BYTES, atomic_write,
@@ -92,6 +95,11 @@ def bootstrap(root: Path, request: dict[str, Any], deadline: Deadline) -> dict[s
             ["apt-get", "install", "-y", "-qq", "git", "cmake", "build-essential"],
             root, deadline, "Installing missing build dependencies",
         )
+    if request.get("agent") is True:
+        from agent_job import bootstrap_tools
+
+        log(root, "Installing pinned Node and checking agent isolation prerequisites.")
+        bootstrap_tools(root, deadline)
     virtualenv = root / "venv"
     logged_command(
         [sys.executable, "-m", "venv", str(virtualenv)],
@@ -208,14 +216,19 @@ def wait_for_server(
         deadline.sleep(1)
 
 
-def server_args(binary: Path, model: Path, context_size: int, port: int) -> list[str]:
+def server_args(
+    binary: Path, model: Path, context_size: int, port: int, api_key_file: Path | None = None,
+) -> list[str]:
     # The pinned runtime maps loader INFO messages to trace verbosity.
-    return [
+    args = [
         str(binary), "--model", str(model), "--host", "127.0.0.1", "--port", str(port),
         "--ctx-size", str(context_size), "--parallel", "1", "--n-gpu-layers", "all",
         "--fit", "off", "--no-context-shift", "--alias", "batch-model",
         "--offline", "--log-colors", "off", "--verbosity", "4",
     ]
+    if api_key_file is not None:
+        args.extend(["--api-key-file", str(api_key_file), "--no-agent", "--no-webui"])
+    return args
 
 
 def wait_for_gpu_offload(
@@ -244,7 +257,82 @@ def wait_for_gpu_offload(
             deadline.sleep(min(0.1, remaining))
 
 
-def infer(root: Path, request: dict[str, Any], deadline: Deadline) -> dict[str, Any]:
+def request_secrets(request: dict[str, Any]) -> tuple[str, ...]:
+    token = request.get("hf_token")
+    task_env = request.get("task_env", {})
+    values = [token] if isinstance(token, str) else []
+    if isinstance(task_env, dict):
+        values.extend(value for value in task_env.values() if isinstance(value, str))
+    return tuple(values)
+
+
+@dataclass
+class ModelRuntime:
+    http: requests.Session
+    url: str
+    gpu: dict[str, Any]
+    context_size: int
+    max_tokens: int
+    temperature: float
+    secrets: tuple[str, ...] = field(repr=False)
+
+    def post(self, path: str, payload: dict[str, Any], deadline: Deadline) -> dict[str, Any]:
+        import requests
+
+        remaining = deadline.remaining()
+        connect_timeout = min(5, remaining / 2)
+        try:
+            response = self.http.post(
+                self.url + path, json=payload,
+                timeout=(connect_timeout, remaining - connect_timeout), allow_redirects=False,
+            )
+        except requests.RequestException as error:
+            raise JobError(f"Model request failed: {error_text(error, self.secrets)}") from error
+        try:
+            result = object_value(response.json(), "Model response")
+        except ValueError as error:
+            raise JobError("Model returned invalid response JSON.") from error
+        if response.status_code != 200:
+            detail = redact(str(result.get("error", "Inference rejected")), self.secrets)
+            raise JobError(f"Model request failed: HTTP {response.status_code}, {detail[:1000]}")
+        deadline.remaining()
+        return result
+
+    def complete(
+        self, messages: list[dict[str, str]], schema: dict[str, Any] | None, deadline: Deadline,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "model": "batch-model", "messages": messages,
+            "max_tokens": self.max_tokens, "temperature": self.temperature, "stream": False,
+        }
+        if schema is not None:
+            rendered = self.post("/apply-template", {"messages": messages}, deadline)
+            prompt = rendered.get("prompt")
+            if not isinstance(prompt, str) or not prompt:
+                raise JobError("Model returned no rendered agent prompt.")
+            tokenized = self.post(
+                "/tokenize", {"content": prompt, "add_special": False, "parse_special": True}, deadline,
+            )
+            tokens = tokenized.get("tokens")
+            if not isinstance(tokens, list) or not tokens or any(
+                isinstance(token, bool) or not isinstance(token, int) or token < 0 for token in tokens
+            ):
+                raise JobError("Model returned invalid agent context token counts.")
+            if len(tokens) + self.max_tokens > self.context_size:
+                raise JobError(
+                    f"Agent history needs {len(tokens)} input tokens plus {self.max_tokens} output tokens; "
+                    f"context limit is {self.context_size}. Increase --context-size or reduce tool output."
+                )
+            payload["response_format"] = {"type": "json_object", "schema": schema}
+        completion = self.post("/v1/chat/completions", payload, deadline)
+        completion_text(completion)
+        return completion
+
+
+@contextmanager
+def model_runtime(
+    root: Path, request: dict[str, Any], deadline: Deadline, *, agent: bool = False,
+) -> Iterator[ModelRuntime]:
     import requests
 
     token = request.get("hf_token")
@@ -276,63 +364,90 @@ def infer(root: Path, request: dict[str, Any], deadline: Deadline) -> dict[str, 
         key: value for key, value in os.environ.items()
         if "TOKEN" not in key.upper() and "API_KEY" not in key.upper()
     }
-    log(root, "Loading the GGUF into the CUDA runtime.", token)
-    with (root / "remote.log").open("ab") as output:
-        log_offset = output.tell()
-        process = subprocess.Popen(
-            server_args(binary, model, context_size, port),
-            stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
-            env=environment, start_new_session=True,
-        )
-        http = requests.Session()
-        http.trust_env = False
-        try:
-            wait_for_server(process, url, deadline, http)
-            wait_for_gpu_offload(process, root / "remote.log", log_offset, deadline)
-            remaining = deadline.remaining()
-            connect_timeout = min(5, remaining / 2)
+    protected_key = secrets.token_urlsafe(32) if agent else ""
+    api_key_file = root / "llama-api-key" if agent else None
+    if api_key_file is not None:
+        atomic_write(api_key_file, (protected_key + "\n").encode())
+    try:
+        log(root, "Loading the GGUF into the CUDA runtime.", token)
+        with (root / "remote.log").open("ab") as output:
+            log_offset = output.tell()
+            http = requests.Session()
+            http.trust_env = False
+            if protected_key:
+                http.headers["Authorization"] = f"Bearer {protected_key}"
+            process = None
             try:
-                response = http.post(
-                    f"{url}/v1/chat/completions",
-                    json={
-                        "model": "batch-model", "messages": [{"role": "user", "content": prompt}],
-                        "max_tokens": max_tokens, "temperature": temperature, "stream": False,
-                    },
-                    timeout=(connect_timeout, remaining - connect_timeout),
-                    allow_redirects=False,
+                process = subprocess.Popen(
+                    server_args(binary, model, context_size, port, api_key_file),
+                    stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
+                    env=environment, start_new_session=True,
                 )
-            except requests.RequestException as error:
-                raise JobError(f"Model request failed: {error_text(error, (token,))}") from error
-            try:
-                completion = object_value(response.json(), "Completion response")
-            except ValueError as error:
-                raise JobError("Model returned invalid completion JSON.") from error
-            if response.status_code != 200:
-                detail = redact(str(completion.get("error", "Inference rejected")), (token,))
-                raise JobError(f"Model request failed: HTTP {response.status_code}, {detail[:1000]}")
-            content = completion_text(completion)
-            deadline.remaining()
-            atomic_write(root / "response.txt", content.encode("utf-8"))
-            write_json(root / "completion.json", completion)
-            result = {
-                "status": "completed", "llama_commit": LLAMA_COMMIT, **gpu,
-                "response_sha256": sha256_file(root / "response.txt", deadline),
-                "completion_sha256": sha256_file(root / "completion.json", deadline),
-                "finish_reason": completion["choices"][0]["finish_reason"],
-                "usage": completion.get("usage"),
-            }
-            log(root, "Inference complete; response artifacts are ready for retrieval.", token)
-            return result
-        finally:
-            try:
-                http.close()
+                wait_for_server(process, url, deadline, http)
+                wait_for_gpu_offload(process, root / "remote.log", log_offset, deadline)
+                yield ModelRuntime(
+                    http, url, gpu, context_size, max_tokens, temperature,
+                    (*request_secrets(request), protected_key),
+                )
             finally:
-                stop_process(process)
+                try:
+                    http.close()
+                finally:
+                    if process is not None:
+                        stop_process(process)
+    finally:
+        if api_key_file is not None:
+            api_key_file.unlink(missing_ok=True)
+
+
+def infer(root: Path, request: dict[str, Any], deadline: Deadline) -> dict[str, Any]:
+    with model_runtime(root, request, deadline) as runtime:
+        completion = runtime.complete([{"role": "user", "content": request["prompt"]}], None, deadline)
+        content = completion_text(completion)
+        deadline.remaining()
+        atomic_write(root / "response.txt", content.encode("utf-8"))
+        write_json(root / "completion.json", completion)
+        result = {
+            "status": "completed", "llama_commit": LLAMA_COMMIT, **runtime.gpu,
+            "response_sha256": sha256_file(root / "response.txt", deadline),
+            "completion_sha256": sha256_file(root / "completion.json", deadline),
+            "finish_reason": completion["choices"][0]["finish_reason"],
+            "usage": completion.get("usage"),
+        }
+        log(root, "Inference complete; response artifacts are ready for retrieval.", request["hf_token"])
+        return result
+
+
+def agent(root: Path, request: dict[str, Any], deadline: Deadline) -> dict[str, Any]:
+    from agent_job import Sandbox, run_agent
+    from agent_utils import AgentOptions
+
+    options = object_value(request.get("agent"), "Agent configuration")
+    settings = AgentOptions(
+        max_steps=positive_int(options.get("max_steps"), "Agent step limit"),
+        command_timeout_seconds=number(options.get("command_timeout_seconds"), "Command timeout", positive=True),
+        max_artifact_bytes=positive_int(options.get("max_artifact_bytes"), "Artifact byte limit"),
+    )
+    settings.validate()
+    environment = object_value(request.get("task_env", {}), "Task environment")
+    if any(not isinstance(value, str) for value in environment.values()):
+        raise JobError("Task environment values must be strings.")
+    with model_runtime(root, request, deadline, agent=True) as runtime:
+        sandbox = Sandbox(root, settings, environment, runtime.secrets)
+        inputs = request.get("inputs")
+        sandbox.prepare(deadline, object_value(inputs, "Input bundle") if inputs is not None else None)
+        log(root, "Running the bounded non-root agent loop.", request["hf_token"])
+        result = run_agent(
+            root, request["prompt"], settings, sandbox, runtime.complete,
+            deadline, runtime.gpu, runtime.secrets,
+        )
+        log(root, f"Agent finished with status {result['status']} after {result['steps']} decisions.", request["hf_token"])
+        return result
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="VastAI remote GGUF worker")
-    parser.add_argument("stage", choices=("bootstrap", "infer"))
+    parser.add_argument("stage", choices=("bootstrap", "infer", "agent"))
     args = parser.parse_args(argv)
     root = Path(__file__).resolve().parent
     request: dict[str, Any] = {}
@@ -348,15 +463,12 @@ def main(argv: list[str] | None = None) -> int:
             raise JobError("Inference request exceeds the 8 MiB protocol limit.")
         request = object_value(json.loads(data), "Worker request")
         deadline = Deadline(number(request.get("remaining_seconds"), "Remaining time", positive=True))
-        result = (
-            bootstrap(root, request, deadline) if args.stage == "bootstrap"
-            else infer(root, request, deadline)
-        )
+        stages = {"bootstrap": bootstrap, "infer": infer, "agent": agent}
+        result = stages[args.stage](root, request, deadline)
         print(json.dumps(result, ensure_ascii=False, allow_nan=False))
         return 0
     except (JobError, OSError, ValueError, RuntimeError) as error:
-        token = request.get("hf_token")
-        message = error_text(error, (token,) if isinstance(token, str) else ())
+        message = error_text(error, request_secrets(request))
         print(json.dumps({"status": "failed", "error": message}))
         print(message, file=sys.stderr)
         return 1

@@ -16,11 +16,15 @@ import shutil
 import signal
 import sys
 import tempfile
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 import uuid
 
+from agent_utils import (
+    AgentOptions, MAX_INPUT_BYTES, extract_archive, inspect_directory, pack_directory,
+    task_env_name, validate_manifest,
+)
 from job_utils import (
-    Deadline, DeadlineExceeded, JobError, LLAMA_COMMIT, LLAMA_RELEASE, atomic_write,
+    Deadline, DeadlineExceeded, JobError, LLAMA_COMMIT, LLAMA_RELEASE, MAX_WORKER_REQUEST_BYTES, atomic_write,
     commit_sha, completion_text, error_text, model_filename, number, object_value,
     positive_int, read_json, redact, run_command, sha256_file, write_json,
 )
@@ -51,10 +55,11 @@ def defer_cancellation() -> Iterator[None]:
 class Credentials:
     vast: str = field(repr=False)
     hugging_face: str = field(repr=False)
+    task: dict[str, str] = field(default_factory=dict, repr=False)
 
     @property
-    def secrets(self) -> tuple[str, str]:
-        return self.vast, self.hugging_face
+    def secrets(self) -> tuple[str, ...]:
+        return self.vast, self.hugging_face, *self.task.values()
 
 
 @dataclass(frozen=True)
@@ -74,6 +79,8 @@ class Settings:
     context_size: int = 4096
     max_tokens: int = 1024
     temperature: float = 0.7
+    agent: AgentOptions | None = None
+    max_bandwidth_price: float | None = None
 
     def validate(self) -> None:
         if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", self.model_repo):
@@ -85,6 +92,10 @@ class Settings:
             raise JobError("Prompt must be non-empty UTF-8 text of at most 1 MiB.")
         number(self.max_hourly_price, "Maximum hourly price", positive=True)
         number(self.timeout_minutes, "Timeout minutes", positive=True)
+        if self.max_bandwidth_price is not None and number(
+            self.max_bandwidth_price, "Maximum bandwidth price",
+        ) < 0:
+            raise JobError("Maximum bandwidth price must be non-negative.")
         positive_int(self.disk_gb, "Disk allocation")
         positive_int(self.context_size, "Context size")
         positive_int(self.max_tokens, "Maximum output tokens")
@@ -95,9 +106,22 @@ class Settings:
             raise JobError("GPU policy must be prefer-a100 or a100-only.")
         if not self.credentials.vast.strip() or not self.credentials.hugging_face.strip():
             raise JobError("Both VastAI and Hugging Face credentials are required.")
+        if self.agent is not None:
+            self.agent.validate()
+            if len(self.credentials.task) > 20:
+                raise JobError("At most 20 task environment variables may be forwarded.")
+            for name, value in self.credentials.task.items():
+                task_env_name(name)
+                if (
+                    not isinstance(value, str) or not value.strip() or len(value.encode()) > 4096
+                    or value in (self.credentials.vast, self.credentials.hugging_face)
+                ):
+                    raise JobError(f"Task variable {name} is invalid or reuses a protected credential.")
 
 
-def credentials_from_file(path: Path, *, require_hf: bool = True) -> Credentials:
+def credentials_from_file(
+    path: Path, *, require_hf: bool = True, task_names: Iterable[str] = (),
+) -> Credentials:
     from dotenv import dotenv_values
 
     if not path.is_file():
@@ -112,9 +136,14 @@ def credentials_from_file(path: Path, *, require_hf: bool = True) -> Credentials
             return ""
         return result.strip()
 
+    names = list(task_names)
+    if len(set(names)) != len(names):
+        raise JobError("Task environment names must not be duplicated.")
+    task = {task_env_name(name): value(name, True) for name in names}
     return Credentials(
         value("VAST_AI_API_KEY", True),
         value("HUGGING_FACE_ACCESS_TOKEN", require_hf),
+        task,
     )
 
 
@@ -176,12 +205,25 @@ def preflight(
         template, settings.disk_gb, settings.max_hourly_price,
         settings.timeout_minutes * 60 + CLEANUP_SECONDS, deadline,
     )
-    return model, template, choose_offer(offers, settings.gpu_policy, settings.max_hourly_price)
+    return model, template, select_offer(settings, offers)
+
+
+def select_offer(settings: Settings, offers: list[Offer]) -> Offer:
+    if settings.max_bandwidth_price is not None:
+        offers = [
+            offer for offer in offers
+            if max(offer.download_cost_per_gb, offer.upload_cost_per_gb) <= settings.max_bandwidth_price
+        ]
+        if not offers:
+            raise JobError(
+                f"No offers meet the USD {settings.max_bandwidth_price:g}/GB bandwidth cap."
+            )
+    return choose_offer(offers, settings.gpu_policy, settings.max_hourly_price)
 
 
 def preview(settings: Settings, model: dict[str, Any], template: Template, offer: Offer) -> dict[str, Any]:
     return {
-        "dry_run": True, "model": model,
+        "dry_run": True, "mode": "agent" if settings.agent is not None else "run", "model": model,
         "template": {"hash": template.hash_id, "image": template.image},
         "selected_offer": offer.summary(),
         "estimated_model_download_cost_usd": model["size_bytes"] / 1_000_000_000
@@ -192,7 +234,10 @@ def preview(settings: Settings, model: dict[str, Any], template: Template, offer
             "timeout_minutes": settings.timeout_minutes,
             "cleanup_seconds": CLEANUP_SECONDS, "disk_gb": settings.disk_gb,
             "context_size": settings.context_size, "max_tokens": settings.max_tokens,
+            "max_bandwidth_price_per_gb_usd": settings.max_bandwidth_price,
+            **({"agent": settings.agent.public()} if settings.agent is not None else {}),
         },
+        "task_environment_names": sorted(settings.credentials.task),
         "note": "Read-only checks only. No instance was rented. Bandwidth charges are additional.",
     }
 
@@ -215,6 +260,7 @@ class RunState:
         state = cls(directory, output, {
             "run_id": run_id, "label": f"gguf-batch-{run_id}", "output_dir": str(output),
             "started_at": datetime.now(timezone.utc).isoformat(),
+            "mode": "agent" if settings.agent is not None else "run",
             "job_status": "running", "cleanup_status": "not_required",
             "creation_outcome": "not_attempted", "instance_id": None, "warnings": [],
         }, settings.credentials)
@@ -357,28 +403,42 @@ class SSHTransport:
             deadline, secrets=self.state.credentials.secrets, context="Uploading remote worker",
         )
 
+    def upload_agent(self, inputs: Path | None, deadline: Deadline) -> None:
+        files = [ROOT / name for name in ("agent_job.py", "agent_tools.py", "agent_utils.py")]
+        if inputs is not None:
+            files.append(inputs)
+        run_command(
+            ["scp", "-q", *self.options(deadline), "-P", str(self.endpoint.port),
+             *(str(path) for path in files), self.endpoint.scp_path(self.remote_dir + "/")],
+            deadline, secrets=self.state.credentials.secrets, context="Uploading agent tools and inputs",
+        )
+
     def invoke(self, stage: str, request: dict[str, Any], deadline: Deadline) -> dict[str, Any]:
-        if stage not in ("bootstrap", "infer"):
+        if stage not in ("bootstrap", "infer", "agent"):
             raise JobError("Invalid remote worker stage.")
         interpreter = "python3" if stage == "bootstrap" else f"{self.remote_dir}/venv/bin/python"
         payload = {**request, "remaining_seconds": deadline.remaining()}
         command = (
             f"{shlex.quote(interpreter)} {shlex.quote(self.remote_dir + '/remote_job.py')} {stage}"
         )
-        raw = self.command(
-            command, deadline, json.dumps(payload, ensure_ascii=False, allow_nan=False).encode(),
-        )
+        encoded = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode()
+        if len(encoded) > MAX_WORKER_REQUEST_BYTES:
+            raise JobError("Remote request exceeds the 8 MiB protocol limit.")
+        raw = self.command(command, deadline, encoded)
         try:
             result = object_value(json.loads(raw), "Remote worker result")
         except (ValueError, UnicodeError) as error:
             raise JobError("Remote worker returned invalid JSON; see remote.log.") from error
-        expected = "ready" if stage == "bootstrap" else "completed"
-        if result.get("status") != expected or result.get("llama_commit") != LLAMA_COMMIT:
+        expected = {"ready"} if stage == "bootstrap" else {"completed", "failed"} if stage == "agent" else {"completed"}
+        if result.get("status") not in expected or result.get("llama_commit") != LLAMA_COMMIT:
             raise JobError("Remote worker did not confirm the expected pinned inference stage.")
         return result
 
     def fetch(self, filename: str, destination: Path, deadline: Deadline) -> None:
-        if filename not in ("response.txt", "completion.json", "remote.log"):
+        if filename not in (
+            "response.txt", "completion.json", "remote.log", "agent-report.json",
+            "agent-transcript.json", "artifacts.tar",
+        ):
             raise JobError("Invalid remote artifact name.")
         run_command(
             ["scp", "-q", *self.options(deadline), "-P", str(self.endpoint.port),
@@ -483,6 +543,124 @@ def fetch_diagnostics(transport: SSHTransport, state: RunState, deadline: Deadli
         part.unlink(missing_ok=True)
 
 
+def checked_fetch(
+    transport: SSHTransport, filename: str, part: Path, checksum: object, deadline: Deadline,
+) -> None:
+    if not isinstance(checksum, str) or not re.fullmatch(r"[a-f0-9]{64}", checksum):
+        raise JobError(f"Remote agent report has no valid SHA-256 for {filename}.")
+    transport.fetch(filename, part, deadline)
+    if sha256_file(part, deadline) != checksum:
+        raise JobError(f"Retrieved {filename} failed its integrity check.")
+
+
+def retrieve_agent(
+    transport: SSHTransport, state: RunState, options: AgentOptions, deadline: Deadline,
+    expected_report: dict[str, Any] | None = None,
+) -> None:
+    report_part = state.output / "agent-report.json.part"
+    transcript_part = state.output / "agent-transcript.json.part"
+    archive_part = state.output / "artifacts.tar.part"
+    response_part = state.output / "response.txt.part"
+    try:
+        if expected_report is not None:
+            checked_fetch(
+                transport, "agent-report.json", report_part,
+                expected_report.get("agent_report_sha256"), deadline,
+            )
+        else:
+            transport.fetch("agent-report.json", report_part, deadline)
+        report = read_json(report_part)
+        if any(secret and secret.encode() in report_part.read_bytes() for secret in state.credentials.secrets):
+            raise JobError("Agent report contains a protected credential value.")
+        if expected_report is not None and report != {
+            key: value for key, value in expected_report.items() if key != "agent_report_sha256"
+        }:
+            raise JobError("Agent report does not match the worker result.")
+        if report.get("status") not in ("completed", "failed") or report.get("llama_commit") != LLAMA_COMMIT:
+            raise JobError("Agent report has an invalid outcome or runtime revision.")
+        steps = report.get("steps")
+        if (
+            isinstance(steps, bool) or not isinstance(steps, int) or not 0 <= steps <= options.max_steps
+            or report.get("max_steps") != options.max_steps
+        ):
+            raise JobError("Agent report has invalid step counts.")
+        checked_fetch(
+            transport, "agent-transcript.json", transcript_part, report.get("transcript_sha256"), deadline,
+        )
+        transcript = read_json(transcript_part)
+        if any(secret and secret.encode() in transcript_part.read_bytes() for secret in state.credentials.secrets):
+            raise JobError("Agent transcript contains a protected credential value.")
+        if (
+            transcript.get("version") != 1
+            or transcript.get("prompt_sha256") != state.data["settings"]["prompt_sha256"]
+            or not isinstance(transcript.get("steps"), list) or len(transcript["steps"]) != steps
+        ):
+            raise JobError("Agent transcript does not match the task and reported decisions.")
+        atomic_write(state.output / "agent-report.json", report_part.read_bytes())
+        atomic_write(state.output / "agent-transcript.json", transcript_part.read_bytes())
+        state.data["agent"] = {
+            "status": report["status"], "steps": steps,
+            "environment_names": report.get("environment_names"),
+        }
+        archive = report.get("archive")
+        if archive is not None:
+            bundle = object_value(archive, "Agent archive")
+            maximum = options.max_artifact_bytes
+            manifest = validate_manifest(bundle.get("manifest"), maximum)
+            checked_fetch(transport, "artifacts.tar", archive_part, bundle.get("sha256"), deadline)
+            if archive_part.stat().st_size != bundle.get("size_bytes"):
+                raise JobError("Agent archive size does not match its report.")
+            destination = state.output / "artifacts"
+            if destination.exists():
+                files, _ = inspect_directory(destination, maximum)
+                if {name for _, name, _ in files} != set(manifest):
+                    raise JobError("Previously retrieved agent artifacts do not match the manifest.")
+                for path, name, size in files:
+                    if size != manifest[name]["size_bytes"] or sha256_file(path, deadline) != manifest[name]["sha256"]:
+                        raise JobError("Previously retrieved agent artifacts failed integrity checks.")
+            else:
+                with tempfile.TemporaryDirectory(dir=state.output, prefix=".artifacts-") as temporary:
+                    unpacked = Path(temporary) / "files"
+                    unpacked.mkdir(mode=0o700)
+                    extract_archive(
+                        archive_part, unpacked, bundle["manifest"], deadline, maximum=maximum,
+                    )
+                    for path, name, _ in inspect_directory(unpacked, maximum)[0]:
+                        data = path.read_bytes()
+                        if any(secret and (secret in name or secret.encode() in data)
+                               for secret in state.credentials.secrets):
+                            raise JobError("Retrieved workspace contains a protected credential value.")
+                    os.replace(unpacked, destination)
+            state.data["agent"]["artifacts"] = len(manifest)
+            state.data["agent"]["excluded_paths"] = bundle["manifest"]["excluded_paths"]
+        elif report["status"] == "completed":
+            raise JobError("Completed agent did not provide its workspace archive.")
+        else:
+            warning = "Agent workspace could not be collected: " + str(report.get("artifact_error", "No archive"))
+            state.data["warnings"].append(warning)
+            state.log(warning)
+        summary = report.get("final_response")
+        if summary is not None:
+            if not isinstance(summary, str) or not summary.strip():
+                raise JobError("Agent final response is invalid.")
+            checked_fetch(
+                transport, "response.txt", response_part, report.get("response_sha256"), deadline,
+            )
+            if response_part.read_bytes() != summary.encode():
+                raise JobError("Agent final response does not match its structured report.")
+            atomic_write(state.output / "response.txt", response_part.read_bytes())
+        elif report["status"] == "completed":
+            raise JobError("Completed agent did not provide a final response.")
+        if report["status"] == "failed" and (
+            not isinstance(report.get("error"), str) or not report["error"].strip()
+        ):
+            raise JobError("Failed agent did not provide an explicit error.")
+        state.data["agent_artifacts_retrieved"] = True
+    finally:
+        for part in (report_part, transcript_part, archive_part, response_part):
+            part.unlink(missing_ok=True)
+
+
 def cleanup_owned(client: VastClient, state: RunState, deadline: Deadline) -> None:
     if state.data["creation_outcome"] in ("not_attempted", "rejected"):
         state.data["cleanup_status"] = "not_required"
@@ -553,7 +731,11 @@ def run_workflow(
             "timeout_minutes": settings.timeout_minutes, "gpu_policy": settings.gpu_policy,
             "disk_gb": settings.disk_gb, "context_size": settings.context_size,
             "max_tokens": settings.max_tokens, "temperature": settings.temperature,
+            "max_bandwidth_price_per_gb_usd": settings.max_bandwidth_price,
             "prompt_sha256": hashlib.sha256(settings.prompt.encode()).hexdigest(),
+            **({
+                "agent": settings.agent.public(), "task_environment_names": sorted(settings.credentials.task),
+            } if settings.agent is not None else {}),
         },
     })
     transport: SSHTransport | None = None
@@ -562,8 +744,15 @@ def run_workflow(
     reporting_failure: str | None = None
     succeeded = False
     creation_attempted = False
+    input_bundle: dict[str, Any] | None = None
     state.log(f"Run {state.data['run_id']}: selected {offer.gpu_name} at ${offer.hourly_price:.4f}/hour.")
     try:
+        if settings.agent is not None and settings.agent.input_dir is not None:
+            input_bundle = pack_directory(
+                settings.agent.input_dir, state.directory / "inputs.tar", deadline,
+                maximum=MAX_INPUT_BYTES, secrets=settings.credentials.secrets, input_files=True,
+            )
+            state.data["inputs"] = input_bundle
         state.persist()
         key = state.directory / "id_ed25519"
         run_command(
@@ -575,7 +764,7 @@ def run_workflow(
             template, settings.disk_gb, settings.max_hourly_price,
             deadline.remaining() + CLEANUP_SECONDS, deadline, offer_id=offer.id,
         )
-        offer = choose_offer(refreshed, settings.gpu_policy, settings.max_hourly_price)
+        offer = select_offer(settings, refreshed)
         state.data["offer"] = offer.summary()
         state.data["creation_outcome"] = "unknown"
         state.data["creation_started_at"] = datetime.now(timezone.utc).isoformat()
@@ -599,21 +788,37 @@ def run_workflow(
         transport = wait_ready(client, state, deadline, transport_factory)
         state.log("Uploading the worker and building the pinned CUDA runtime.")
         transport.upload(deadline)
-        transport.invoke("bootstrap", {"gpu_name": offer.gpu_name}, deadline)
-        state.log("Downloading the GGUF and generating the response remotely.")
-        report = transport.invoke("infer", {
+        if settings.agent is not None:
+            transport.upload_agent(state.directory / "inputs.tar" if input_bundle is not None else None, deadline)
+        transport.invoke("bootstrap", {
+            "gpu_name": offer.gpu_name, **({"agent": True} if settings.agent is not None else {}),
+        }, deadline)
+        state.log("Downloading the GGUF and running the agent remotely." if settings.agent is not None
+                  else "Downloading the GGUF and generating the response remotely.")
+        request = {
             "model": model, "hf_token": settings.credentials.hugging_face,
             "prompt": settings.prompt, "gpu_name": offer.gpu_name,
             "context_size": settings.context_size, "max_tokens": settings.max_tokens,
             "temperature": settings.temperature,
-        }, deadline)
+        }
+        if settings.agent is not None:
+            request.update({
+                "agent": settings.agent.public(), "task_env": settings.credentials.task, "inputs": input_bundle,
+            })
+        report = transport.invoke("agent" if settings.agent is not None else "infer", request, deadline)
         gpu_name = report.get("gpu_name")
         gpu_memory = number(report.get("gpu_vram_mib"), "Reported GPU VRAM", positive=True)
         if not isinstance(gpu_name, str) or not gpu_name.strip() or gpu_memory < 24_000:
             raise JobError("Remote worker did not report a valid >=24 GB NVIDIA GPU.")
         state.data["remote_gpu"] = {"gpu_name": gpu_name, "gpu_vram_mib": gpu_memory}
-        state.log("Retrieving and validating the model response.")
-        retrieve(transport, state, report, deadline)
+        state.log("Retrieving and validating agent outputs." if settings.agent is not None
+                  else "Retrieving and validating the model response.")
+        if settings.agent is not None:
+            retrieve_agent(transport, state, settings.agent, deadline, report)
+            if report["status"] == "failed":
+                raise JobError("Remote agent failed: " + str(report["error"]))
+        else:
+            retrieve(transport, state, report, deadline)
         try:
             fetch_diagnostics(transport, state, deadline)
         except (HostKeyError, DeadlineExceeded):
@@ -641,6 +846,16 @@ def run_workflow(
         cleanup_deadline = Deadline(CLEANUP_SECONDS)
         with defer_cancellation():
             if not succeeded and transport is not None:
+                if settings.agent is not None and not state.data.get("agent_artifacts_retrieved"):
+                    try:
+                        retrieve_agent(
+                            transport, state, settings.agent,
+                            Deadline(min(45, cleanup_deadline.remaining())),
+                        )
+                    except (JobError, OSError, ValueError) as error:
+                        warning = "Partial agent artifacts unavailable: " + error_text(error, settings.credentials.secrets)
+                        state.data["warnings"].append(warning)
+                        state.log(warning)
                 try:
                     fetch_diagnostics(
                         transport, state, Deadline(min(30, cleanup_deadline.remaining())),
@@ -681,26 +896,37 @@ def run_workflow(
 
 
 def parser_for_cli() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run a GGUF prompt on a temporary VastAI GPU.")
+    parser = argparse.ArgumentParser(description="Run a GGUF prompt or action-capable agent on a temporary VastAI GPU.")
     commands = parser.add_subparsers(dest="command", required=True)
-    run = commands.add_parser("run", help="Rent, infer, retrieve, and destroy.")
-    run.add_argument("--model-repo", required=True, help="Hugging Face owner/repository.")
-    run.add_argument("--model-file", required=True, help="Exact standalone GGUF filename.")
-    prompt = run.add_mutually_exclusive_group(required=True)
-    prompt.add_argument("--prompt", help="Prompt text; use quotes to preserve shell characters.")
-    prompt.add_argument("--prompt-file", type=Path, help="UTF-8 prompt file.")
-    run.add_argument("--model-revision", default="main")
-    run.add_argument("--template-hash", default=DEFAULT_TEMPLATE_HASH)
-    run.add_argument("--env-file", type=Path, default=ROOT / ".env")
-    run.add_argument("--output-dir", type=Path, default=ROOT / "modeloutput")
-    run.add_argument("--max-hourly-price", type=float, default=4.0)
-    run.add_argument("--timeout-minutes", type=float, default=180)
-    run.add_argument("--gpu-policy", choices=("prefer-a100", "a100-only"), default="prefer-a100")
-    run.add_argument("--disk-gb", type=int, default=64)
-    run.add_argument("--context-size", type=int, default=4096)
-    run.add_argument("--max-tokens", type=int, default=1024)
-    run.add_argument("--temperature", type=float, default=0.7)
-    run.add_argument("--dry-run", action="store_true", help="Only validate and query metadata/offers.")
+    for name in ("run", "agent"):
+        run = commands.add_parser(name, help="Rent, infer, retrieve, and destroy." if name == "run"
+                                  else "Run remote actions, retrieve artifacts, and destroy.")
+        run.add_argument("--model-repo", required=True, help="Hugging Face owner/repository.")
+        run.add_argument("--model-file", required=True, help="Exact standalone GGUF filename.")
+        prompt = run.add_mutually_exclusive_group(required=True)
+        prompt.add_argument("--prompt", help="Prompt text; use quotes to preserve shell characters.")
+        prompt.add_argument("--prompt-file", type=Path, help="UTF-8 task/prompt file, including Markdown.")
+        run.add_argument("--model-revision", default="main")
+        run.add_argument("--template-hash", default=DEFAULT_TEMPLATE_HASH)
+        run.add_argument("--env-file", type=Path, default=ROOT / ".env")
+        run.add_argument("--output-dir", type=Path, default=ROOT / "modeloutput")
+        run.add_argument("--max-hourly-price", type=float, default=4.0)
+        run.add_argument("--max-bandwidth-price", type=float,
+                         help="Optional advertised USD/GB cap for both ingress and egress.")
+        run.add_argument("--timeout-minutes", type=float, default=180)
+        run.add_argument("--gpu-policy", choices=("prefer-a100", "a100-only"), default="prefer-a100")
+        run.add_argument("--disk-gb", type=int, default=64)
+        run.add_argument("--context-size", type=int, default=4096 if name == "run" else 16384)
+        run.add_argument("--max-tokens", type=int, default=1024 if name == "run" else 2048)
+        run.add_argument("--temperature", type=float, default=0.7 if name == "run" else 0)
+        run.add_argument("--dry-run", action="store_true", help="Only validate and query metadata/offers.")
+        if name == "agent":
+            run.add_argument("--input-dir", type=Path, help="Optional small, credential-free workspace snapshot.")
+            run.add_argument("--agent-env", action="append", default=[], metavar="NAME",
+                             help="Forward only this selected task variable from the chosen .env/environment.")
+            run.add_argument("--max-steps", type=int, default=30)
+            run.add_argument("--command-timeout-seconds", type=float, default=120)
+            run.add_argument("--max-artifact-mb", type=int, default=64)
     cleanup = commands.add_parser("cleanup", help="Destroy only resources owned by a recorded run.")
     cleanup.add_argument("--run-id", required=True)
     cleanup.add_argument("--env-file", type=Path, default=ROOT / ".env")
@@ -719,7 +945,10 @@ def main(argv: list[str] | None = None) -> int:
     for sig in handlers:
         signal.signal(sig, cancelled)
     try:
-        credentials = credentials_from_file(args.env_file.resolve(), require_hf=args.command == "run")
+        credentials = credentials_from_file(
+            args.env_file.resolve(), require_hf=args.command != "cleanup",
+            task_names=args.agent_env if args.command == "agent" else (),
+        )
         client = VastClient(credentials.vast)
         if args.command == "cleanup":
             state = RunState.load(args.run_id, ROOT / ".vastai-runs", credentials)
@@ -745,12 +974,20 @@ def main(argv: list[str] | None = None) -> int:
             prompt = args.prompt_file.read_text(encoding="utf-8")
         else:
             prompt = args.prompt
+        agent_options = None
+        if args.command == "agent":
+            agent_options = AgentOptions(
+                args.max_steps, args.command_timeout_seconds, args.max_artifact_mb * 1024 ** 2,
+                args.input_dir.absolute() if args.input_dir is not None else None,
+            )
         settings = Settings(
             args.model_repo, args.model_file, prompt, credentials,
             args.output_dir.resolve(), ROOT / ".vastai-runs",
             args.model_revision, args.template_hash, args.max_hourly_price,
             args.timeout_minutes, args.gpu_policy, args.disk_gb,
             args.context_size, args.max_tokens, args.temperature,
+            agent_options,
+            args.max_bandwidth_price,
         )
         settings.validate()
         if args.dry_run:
@@ -761,6 +998,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         state = run_workflow(settings, client)
         print(f"Response: {state.output / 'response.txt'}")
+        if settings.agent is not None:
+            print(f"Agent files: {state.output / 'artifacts'}; transcript: {state.output / 'agent-transcript.json'}")
         print(f"Instance destruction confirmed. Metadata: {state.output / 'metadata.json'}")
         return 0
     except (JobError, OSError, ValueError) as error:

@@ -1,6 +1,6 @@
 # VastAIBatchJobs
 
-Run one prompt against a Hugging Face GGUF model on a fresh VastAI GPU, retrieve the response into this repository, then destroy the instance. The controller runs locally; model weights and CUDA inference stay on the rented instance.
+Run a single prompt or an action-capable agent against a Hugging Face GGUF model on a fresh VastAI GPU, retrieve the results into this repository, then destroy the instance. The controller runs locally; model weights, CUDA inference, and agent actions stay on the rented instance.
 
 A **GGUF** file packages model weights and inference metadata, including tokenizer and architecture information. It is not an executable. This workflow builds a pinned CUDA version of [llama.cpp](https://github.com/ggml-org/llama.cpp) and uses its chat-completion server to run the model.
 
@@ -48,7 +48,65 @@ python run_job.py run \
 5. Generate one non-streaming assistant response through a loopback-only server.
 6. Retrieve and verify the response, destroy the instance, and confirm its absence.
 
-For a longer or sensitive prompt, create a UTF-8 file and use `--prompt-file ./prompt.txt` instead of `--prompt`. The options are mutually exclusive. A prompt file avoids shell quoting/expansion and keeps prompt text out of local process arguments and shell history. Prompt size is limited to 1 MiB, but the model's token context can impose a much smaller practical limit.
+For a longer or sensitive prompt, create a UTF-8 file and use `--prompt-file ./research.md` instead of `--prompt`. Markdown needs no conversion; the whole file becomes the prompt, and referenced local files are not automatically uploaded. The options are mutually exclusive. A prompt file avoids shell quoting/expansion and keeps prompt text out of local process arguments and shell history. Prompt size is limited to 1 MiB, but the model's token context can impose a much smaller practical limit.
+
+## Agent actions
+
+`run` remains a single model response. **`agent` executes actions**, observes their results, and asks the model for the next action until it finishes or reaches a limit. It uses schema-constrained JSON decisions, not model-specific native function calls.
+
+```bash
+python run_job.py agent \
+  --model-repo bartowski/Meta-Llama-3.1-8B-Instruct-GGUF \
+  --model-file Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf \
+  --prompt-file ./examples/hardhat-research.md \
+  --agent-env ALCHEMY_API_KEY \
+  --agent-env ETHERSCAN_API_KEY \
+  --gpu-policy a100-only \
+  --max-hourly-price 1 \
+  --max-bandwidth-price 0.01 \
+  --timeout-minutes 30 \
+  --context-size 32768 \
+  --max-tokens 3072
+```
+
+This is a paid run. Add `--dry-run` to inspect the model/template/offer without executing actions or renting an instance. The supplied [Hardhat task](examples/hardhat-research.md) instructs the agent to create and execute its own scripts on a local Ethereum mainnet fork, read native ETH balances for two randomly sampled verified contracts, fetch deployed bytecode through Alchemy, obtain verified Solidity through Etherscan, and write a source-grounded report. **Alchemy `eth_getCode` returns bytecode, not verified Solidity.** No transactions, deployment, or wallet credentials are needed.
+
+Add `ALCHEMY_API_KEY` and `ETHERSCAN_API_KEY` to the selected `.env` for this example. Each `--agent-env NAME` forwards only that named variable to command processes over SSH stdin. Process-environment precedence is unchanged. Missing/empty selected variables fail before rental. The VastAI/Hugging Face credentials and identity/interpreter variables cannot be forwarded this way. Values are not included in model messages or metadata.
+
+Available actions are `run` with an argv array, `read_file`, `write_file`, `list_files`, and `finish`. CLI arguments are not implicitly shell-expanded. File tools support only relative paths inside the workspace, reject symlinks/hardlinks, and create missing parent directories for writes. `read_file` returns a byte `next_offset` for paginated UTF-8 reading. Node **v22.23.3**, npm, and Python are available remotely; the Node archive is checked against its pinned official SHA-256. Package installs run without root privileges.
+
+| Agent option | Default | Meaning |
+| --- | --- | --- |
+| `--input-dir` | None | Snapshot a small local input directory into the remote workspace |
+| `--agent-env NAME` | None | Repeat to select task variables explicitly |
+| `--max-steps` | `30` | Model decisions, including finish attempts; maximum 200 |
+| `--command-timeout-seconds` | `120` | Wall-clock limit per tool invocation; maximum 600 |
+| `--max-artifact-mb` | `64` | Returned workspace byte limit, in MiB; maximum 1024 |
+| `--context-size` | `16384` | Agent history and reserved output tokens |
+| `--max-tokens` | `2048` | Tokens per model decision |
+| `--temperature` | `0` | Agent generation temperature |
+
+Other instance/model/output defaults match `run`. Input snapshots are limited to 64 MiB and 5,000 files. Symlinks, hardlinks, special files, common credential paths, and dependency directories are refused. Known credential values are checked before upload; this cannot detect every possible secret, so review selected input files yourself. Relative `--input-dir` paths resolve against the caller's current directory.
+
+Commands run as a dedicated non-root Linux user with cleared groups/capabilities, no-new-privileges, a clean environment, resource limits, and a private workspace/home. Standard output and error are each bounded to 16 KiB; truncation is explicit. Remaining processes owned by that identity are killed after each action, so background services are not preserved. The model server uses a private API-key file unavailable to tool processes. **This is not a full hostile-code sandbox or an egress firewall.** Tools have internet access and can use approved task keys; trust the task, dependencies, scripts, and rented host. No local filesystem is mounted.
+
+Agent output:
+
+```text
+modeloutput/<run-id>/
+  response.txt
+  agent-report.json
+  agent-transcript.json
+  artifacts/
+    <generated scripts, outputs, source evidence, and report>
+  metadata.json
+  workflow.log
+  remote.log
+```
+
+`response.txt` is the summary from the final JSON decision, not an OpenAI completion envelope. The report records outcome, limits, decisions, and the workspace manifest/checksums. The transcript preserves decisions, model completions, and actual tool observations; it can contain private task/file content. There is no `completion.json` for agent mode. Dependencies/caches named `node_modules`, `.git`, `.venv`, `venv`, `__pycache__`, `.cache`, or `.npm` are intentionally excluded and listed in the manifest. Keep the returned package manifest/lockfile to reinstall dependencies.
+
+Credential-bearing files or unsafe/oversized archives are refused rather than silently copied. Generated script bytes are not rewritten. Tool failures are returned to the model for correction. Malformed or token-limited decisions never execute; context overflow and exhausted step/job budgets fail explicitly. Failed runs preserve available partial scripts, outputs, and transcripts before teardown. Finishing alone is not evidence that every task claim is correct: inspect the execution transcript and source references.
 
 ## Inputs and defaults
 
@@ -60,6 +118,7 @@ For a longer or sensitive prompt, create a UTF-8 file and use `--prompt-file ./p
 | `--template-hash` | `661d064bbda1f2a133816b6d55da07c3` | Compatible CUDA development/SSH template |
 | `--gpu-policy` | `prefer-a100` | Prefer any eligible A100; fall back to another compatible NVIDIA GPU. `a100-only` forbids fallback |
 | `--max-hourly-price` | `4.00` | Advertised USD/hour cap, including the requested storage |
+| `--max-bandwidth-price` | None | Optional advertised USD/GB cap for both ingress and egress, rechecked before creation |
 | `--timeout-minutes` | `180` | Job deadline covering preflight through response retrieval |
 | `--disk-gb` | `64` | Instance disk allocation |
 | `--context-size` | `4096` | Total model context, including input and output |
@@ -119,11 +178,11 @@ If creation's response is lost, the workflow reconciles its unique label instead
 
 USD 4/hour for 180 minutes is a nominal USD 12 limit on the advertised hourly component, **not a total invoice cap**. The offer is repriced for the requested disk and rechecked immediately before creation. Model-download bandwidth, result-upload bandwidth, cleanup time, and provider pricing changes can add charges. The preview shows advertised bandwidth rates and estimated model-download cost.
 
-Only the Hugging Face token and job request go to the remote worker, through encrypted SSH stdin. The VastAI key and `.env` remain local. The runtime listens only on `127.0.0.1`; no public inference endpoint is exposed. First SSH contact uses trust-on-first-use with an isolated known-hosts file; subsequent key changes are rejected. Rented hosts still need to be trusted with your prompt and read token.
+The Hugging Face token, job request, and any explicitly selected agent task variables go to the remote worker through encrypted SSH stdin. The VastAI key and `.env` remain local. The Hugging Face token is used by the privileged downloader, not injected into agent command processes. The runtime listens only on `127.0.0.1`; no public inference endpoint is exposed. First SSH contact uses trust-on-first-use with an isolated known-hosts file; subsequent key changes are rejected. Rented hosts still need to be trusted with your prompt and selected credentials.
 
 Credential values and URL query strings are redacted from collected diagnostics. Local result/state directories are private, and final artifact files use mode `0600`. `.env`, `.venv`, `.vastai-runs`, and default `modeloutput` are ignored by Git. If you choose another output path inside the repository, ignore it separately; do not commit sensitive prompt files or generated results.
 
-This is a synchronous, one-prompt workflow, not training, an agent/tool runner, an interactive session, or a persistent endpoint. Use a standalone text GGUF supported by the pinned runtime. Split GGUFs, multimodal sidecars, and adapters are unsupported; common filename patterns are rejected before rental. Differently named unsupported architectures or files fail explicitly during remote loading. CPU fallback and partial GPU-layer offload are not accepted as successful GPU execution.
+Both modes are synchronous, one-task-per-instance workflows, not training, interactive sessions, or persistent endpoints. `run` produces one response; `agent` can perform bounded multi-step actions. Use a standalone text GGUF supported by the pinned runtime. Split GGUFs, multimodal sidecars, and adapters are unsupported; common filename patterns are rejected before rental. Differently named unsupported architectures or files fail explicitly during remote loading. CPU fallback and partial GPU-layer offload are not accepted as successful GPU execution.
 
 The worker sets server verbosity to `4`: the pinned runtime hides its model-loader and GPU-offload diagnostics at the default level `3`. After healthy startup, it waits briefly for the asynchronous logger to report nonzero full layer offload from this server, not an earlier log entry. Missing, zero, or partial offload still fails before generation and triggers teardown.
 
@@ -133,11 +192,11 @@ Runtime source is pinned to llama.cpp **v0.6.0**, commit `8345f333951c661d166b00
 
 ```bash
 python -m unittest discover -s tests
-python -m compileall -q run_job.py vast_client.py remote_job.py job_utils.py
+python -m compileall -q run_job.py vast_client.py remote_job.py job_utils.py agent_job.py agent_tools.py agent_utils.py
 python run_job.py --help
 ```
 
-Tests use fake cloud/SSH/downloader interfaces, temporary directories, fake clocks, and a local HTTP fixture. They never read your actual `.env`, rent a GPU, download real weights, or require CUDA. They cover teardown, uncertain allocation, cancellation, recovery isolation, artifact integrity, credential redaction, full GPU-offload evidence, and price/VRAM boundaries.
+Tests use fake cloud/SSH/downloader interfaces, temporary directories, fake clocks, and local HTTP fixtures. Agent tests create and execute real local test scripts and inspect their outputs; Linux privilege setup is verified separately through its contracts. Tests never read your actual `.env`, rent a GPU, download real weights, or require CUDA. They cover teardown, uncertain allocation, cancellation, recovery isolation, artifact integrity, credential redaction, full GPU-offload evidence, price/VRAM boundaries, actual multi-step actions, and negative tool/archive/context/step-limit boundaries.
 
 Live read-only template, model metadata, offer pagination, and CLI dry-run checks have been exercised. The default-verbosity failure from an earlier paid run is reproduced by a local regression.
 
