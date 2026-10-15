@@ -66,13 +66,15 @@ python run_job.py agent \
   --max-hourly-price 1 \
   --max-bandwidth-price 0.01 \
   --timeout-minutes 30 \
-  --context-size 32768 \
+  --context-size 65536 \
   --max-tokens 3072
 ```
 
 This is a paid run. Add `--dry-run` to inspect the model/template/offer without executing actions or renting an instance. The supplied [Hardhat task](examples/hardhat-research.md) instructs the agent to create and execute its own scripts on a local Ethereum mainnet fork, read native ETH balances for two randomly sampled verified contracts, fetch deployed bytecode through Alchemy, obtain verified Solidity through Etherscan, and write a source-grounded report. **Alchemy `eth_getCode` returns bytecode, not verified Solidity.** No transactions, deployment, or wallet credentials are needed.
 
 The agent example uses a coding-specialized 30B mixture-of-experts model with approximately 3B active parameters, an 18.6 GB Q4 download, and a recommended 40 GB A100. The small 8B model used for the single-response smoke test is not a guarantee of reliable multi-step coding: its first agent attempt repeatedly guessed nonexistent packages. Choose a coding-capable model and inspect the returned evidence.
+
+The research example uses a 65,536-token context because retained script/tool/source history exceeded 32,768 tokens in a real attempt. The workflow fails explicitly instead of silently discarding evidence when history plus reserved output exceeds the limit. Keep metadata output compact, avoid dumping bytecode/ABI, and choose context capacity supported by both the model and GPU.
 
 Add `ALCHEMY_API_KEY` and `ETHERSCAN_API_KEY` to the selected `.env` for this example. Each `--agent-env NAME` forwards only that named variable to command processes over SSH stdin. Process-environment precedence is unchanged. Missing/empty selected variables fail before rental. The VastAI/Hugging Face credentials and identity/interpreter variables cannot be forwarded this way. Values are not included in model messages or metadata.
 

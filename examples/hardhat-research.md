@@ -119,6 +119,18 @@ request signing keys, or use a live network for transaction execution.
    Cite the saved source file and actual function names for each explanation.
    Distinguish observed source behavior from assumptions. Include the sampled
    addresses, block, native ETH balances, and the commands that ran successfully.
+   Write the report directly with `write_file`; a separate report-generating
+   program is unnecessary. Include a short access-control table listing
+   sensitive functions, their actual modifiers, and their caller conditions.
+   Inspect each individual declaration/body, not ERC-20 stereotypes:
+   - For Dai, compare `mint` and `burn` authorization separately, inspect the
+     holder/allowance branches, and describe `permit`'s actual approval values.
+   - For LINK, inspect the exact `validRecipient` expression and
+     `transferAndCall`/`isContract` behavior. Do not confuse `address(this)`
+     with all contract addresses. Distinguish raw supply units from token
+     quantities using `decimals`.
+   - For WETH9, inspect how `totalSupply`, deposits/withdrawals, and delegated
+     transfers derive balances rather than assuming a stored supply counter.
 6. Before finishing, verify both scripts ran successfully, both contracts have
    Alchemy bytecode and verified Solidity files, and the report exists.
    Return a concise final summary pointing to the scripts, JSON outputs,
