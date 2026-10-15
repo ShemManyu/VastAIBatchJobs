@@ -95,7 +95,7 @@ class FakeClient(VastClient):
 
     def offers(self, template: Template, disk_gb: int, max_price: float,
                rental_seconds: float, deadline: Deadline, *,
-               offer_id: int | None = None) -> list[Offer]:
+               offer_id: int | None = None, gpu_count: int = 1) -> list[Offer]:
         self.events.append("revalidate" if offer_id else "offers")
         return [] if self.fail == "no-offers" else [self.offer]
 
@@ -175,6 +175,13 @@ class FakeTransport(SSHTransport):
             "llama_commit": LLAMA_COMMIT, "gpu_name": "NVIDIA A100-SXM4-40GB",
             "gpu_vram_mib": 40960,
         }
+        if request.get("gpu_count", 1) > 1:
+            count = request["gpu_count"]
+            result.update({
+                "gpu_count": count, "gpu_vram_total_mib": 40960 * count,
+                "gpus": [{"gpu_name": "NVIDIA A100-SXM4-40GB", "gpu_vram_mib": 40960}
+                         for _ in range(count)],
+            })
         if stage == "infer":
             completion = {
                 "choices": [{"message": {"role": "assistant", "content": ANSWER},
@@ -200,3 +207,85 @@ class FakeTransport(SSHTransport):
         if self.fail == "checksum" and filename == "response.txt":
             content += b"corrupt"
         destination.write_bytes(content)
+
+
+class FakeAgentTransport(FakeTransport):
+    def upload_agent(self, inputs: Path | None, deadline: Deadline) -> None:
+        self.client.events.append("upload-agent")
+        if self.fail == "upload-agent":
+            raise JobError("Fixture agent upload failed.")
+        self.input_archive = inputs
+
+    def invoke(self, stage: str, request: dict[str, Any], deadline: Deadline) -> dict[str, Any]:
+        if stage != "agent":
+            return super().invoke(stage, request, deadline)
+        self.requests.append((stage, request))
+        self.client.events.append(stage)
+        if self.fail == "agent":
+            raise JobError("Fixture agent transport failed.")
+        from agent_utils import extract_archive, pack_directory
+
+        workspace = self.state.directory / "fixture-workspace"
+        workspace.mkdir()
+        if request.get("inputs") is not None:
+            extract_archive(
+                self.input_archive, workspace, request["inputs"]["manifest"],
+                deadline, maximum=64 * 1024 ** 2,
+            )
+        (workspace / "scripts").mkdir()
+        (workspace / "scripts/task.py").write_text("print(42)\n")
+        (workspace / "result.json").write_text('{"value":42}\n')
+        archive = self.state.directory / "fixture-artifacts.tar"
+        info = pack_directory(workspace, archive, deadline, maximum=64 * 1024 ** 2)
+        transcript = {
+            "version": 1, "prompt_sha256": hashlib.sha256(request["prompt"].encode()).hexdigest(),
+            "steps": [
+                {"step": 1, "action": {"action": "write_file", "path": "scripts/task.py", "content": "print(42)\n"}},
+                {"step": 2, "action": {"action": "run", "argv": ["python3", "scripts/task.py"]},
+                 "observation": {"exit_code": 0, "stdout": "42\n"}},
+            ],
+        }
+        failed = self.fail == "agent-failed"
+        verification_code = request["agent"].get("verification_code")
+        verification = None
+        if verification_code is not None:
+            verification = {
+                "uid": 2001, "sandbox_verified": True, "exit_code": 0,
+                "timed_out": False, "stdout": "verified\n", "stderr": "",
+            }
+        if not failed:
+            transcript["steps"].append({
+                "step": 3, "action": {"action": "finish", "summary": ANSWER},
+                "observation": {"finished": True, **({"verification": verification} if verification else {})},
+            })
+        self.files["agent-transcript.json"] = (json.dumps(transcript) + "\n").encode()
+        self.files["artifacts.tar"] = archive.read_bytes()
+        report = {
+            "status": "failed" if failed else "completed", "llama_commit": LLAMA_COMMIT,
+            "gpu_name": "NVIDIA A100-SXM4-40GB", "gpu_vram_mib": 40960,
+            "steps": len(transcript["steps"]), "max_steps": request["agent"]["max_steps"],
+            "environment_names": sorted(request["task_env"]), "archive": info,
+            "final_response": None if failed else ANSWER,
+            "transcript_sha256": hashlib.sha256(self.files["agent-transcript.json"]).hexdigest(),
+            "verification_sha256": (
+                hashlib.sha256(verification_code.encode()).hexdigest() if verification_code is not None else None
+            ),
+        }
+        if verification is not None:
+            report["verification"] = verification
+        if failed:
+            report["error"] = "Fixture agent exhausted its task deadline."
+        else:
+            self.files["response.txt"] = ANSWER.encode()
+            report["response_sha256"] = hashlib.sha256(self.files["response.txt"]).hexdigest()
+        self.files["agent-report.json"] = (json.dumps(report) + "\n").encode()
+        return {**report, "agent_report_sha256": hashlib.sha256(self.files["agent-report.json"]).hexdigest()}
+
+    def fetch(self, filename: str, destination: Path, deadline: Deadline) -> None:
+        if filename not in self.files:
+            raise JobError(f"Fixture remote artifact is unavailable: {filename}.")
+        if self.fail == "agent-archive" and filename == "artifacts.tar":
+            self.client.events.append(f"fetch:{filename}")
+            destination.write_bytes(b"corrupt archive")
+            return
+        super().fetch(filename, destination, deadline)

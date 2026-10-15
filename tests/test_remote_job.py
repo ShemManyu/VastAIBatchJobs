@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 from job_utils import Deadline, DeadlineExceeded, JobError, LLAMA_COMMIT
 import remote_job
 from remote_job import (
-    bootstrap, download_model, gpu_details, infer, server_args,
+    bootstrap, cuda_architectures, download_model, gpu_details, infer, server_args,
     wait_for_gpu_offload, wait_for_server,
 )
 from tests.fakes import ANSWER, Clock, HF_TOKEN, VAST_TOKEN
@@ -38,6 +38,26 @@ class WorkerFixture(unittest.TestCase):
 
 
 class WorkerTests(WorkerFixture):
+    def split_fixture(self):
+        files = []
+        bodies = {}
+        for index in (1, 2, 3):
+            name = f"Q3/model-0000{index}-of-00003.gguf"
+            body = MODEL_BYTES + bytes([index])
+            bodies[name] = body
+            files.append({"filename": name, "size_bytes": len(body),
+                          "sha256": hashlib.sha256(body).hexdigest()})
+        model = {**self.model, "filename": files[0]["filename"], "files": files,
+                 "size_bytes": sum(item["size_bytes"] for item in files), "sha256": None}
+
+        def download(**kwargs):
+            path = Path(kwargs["local_dir"]) / kwargs["filename"]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(bodies[kwargs["filename"]])
+            return str(path)
+
+        return model, download
+
     def test_download_uses_explicit_remote_path_revision_and_token(self):
         with patch("huggingface_hub.hf_hub_download", side_effect=self.download) as download:
             path = download_model(self.root, self.model, HF_TOKEN, Deadline(30))
@@ -47,6 +67,42 @@ class WorkerTests(WorkerFixture):
         self.assertEqual(download.call_args.kwargs["token"], HF_TOKEN)
         self.assertEqual(download.call_args.kwargs["local_dir"], self.root / "models")
         self.assertNotIn(VAST_TOKEN, json.dumps({key: str(value) for key, value in download.call_args.kwargs.items()}))
+
+    def test_split_download_verifies_all_members_and_returns_first_shard(self):
+        model, transfer = self.split_fixture()
+        with patch("huggingface_hub.hf_hub_download", side_effect=transfer) as download:
+            first = download_model(self.root, model, HF_TOKEN, Deadline(30))
+        self.assertEqual(first, self.root / "models" / model["filename"])
+        self.assertEqual([call.kwargs["filename"] for call in download.call_args_list],
+                         [item["filename"] for item in model["files"]])
+        for item in model["files"]:
+            path = self.root / "models" / item["filename"]
+            self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), item["sha256"])
+
+    def test_corrupt_later_shard_does_not_pass_first_file_integrity(self):
+        model, transfer = self.split_fixture()
+        model["files"][1]["sha256"] = "0" * 64
+        with patch("huggingface_hub.hf_hub_download", side_effect=transfer) as download:
+            with self.assertRaisesRegex(JobError, "SHA-256"):
+                download_model(self.root, model, HF_TOKEN, Deadline(30))
+        self.assertEqual(download.call_count, 2)
+
+    def test_incomplete_reordered_or_unsigned_shards_fail_before_transfer(self):
+        model, _ = self.split_fixture()
+        for members in (model["files"][:-1], list(reversed(model["files"])),
+                        [{**item, "sha256": None} for item in model["files"]]):
+            with self.subTest(members=members), patch("huggingface_hub.hf_hub_download") as download:
+                with self.assertRaises(JobError):
+                    download_model(self.root, {**model, "files": members}, HF_TOKEN, Deadline(30))
+                download.assert_not_called()
+
+    def test_split_free_disk_check_uses_the_whole_set_not_just_first_file(self):
+        model, _ = self.split_fixture()
+        with patch("remote_job.shutil.disk_usage") as disk, patch("huggingface_hub.hf_hub_download") as download:
+            disk.return_value.free = model["size_bytes"] + 2 * 1024 ** 3 - 1
+            with self.assertRaises(JobError):
+                download_model(self.root, model, HF_TOKEN, Deadline(30))
+            download.assert_not_called()
 
     def test_download_size_hash_magic_and_path_are_not_silently_trusted(self):
         variants = (
@@ -94,6 +150,8 @@ class WorkerTests(WorkerFixture):
             self.assertEqual(gpu_details("A100 SXM4", Deadline(10))["gpu_vram_mib"], 40536)
         with patch("remote_job.run_command", return_value=b"NVIDIA A100 80GB PCIe, 81920\n"):
             self.assertEqual(gpu_details("A100_PCIE_80GB", Deadline(10))["gpu_vram_mib"], 81920)
+        with patch("remote_job.run_command", return_value=b"Quadro RTX 8000, 49152\n"):
+            self.assertEqual(gpu_details("Q RTX 8000", Deadline(10))["gpu_vram_mib"], 49152)
         for output in (
             b"RTX 3090, 24576\n", b"NVIDIA A100-SXM4-40GB, 23999\n",
             b"NVIDIA A100-SXM4-40GB, nan\n", b"NVIDIA A100-SXM4-40GB, inf\n",
@@ -102,6 +160,23 @@ class WorkerTests(WorkerFixture):
             with self.subTest(output=output), patch("remote_job.run_command", return_value=output):
                 with self.assertRaises(JobError):
                     gpu_details("A100 SXM4", Deadline(10))
+
+    def test_every_allocated_gpu_is_verified_with_per_device_and_total_memory(self):
+        output = b"NVIDIA A100-SXM4-40GB, 40536\n" * 8
+        with patch("remote_job.run_command", return_value=output):
+            gpu = gpu_details("A100 SXM4", Deadline(10), 8)
+        self.assertEqual(gpu["gpu_count"], 8)
+        self.assertEqual(gpu["gpu_vram_mib"], 40536)
+        self.assertEqual(gpu["gpu_vram_total_mib"], 324288)
+        self.assertEqual(len(gpu["gpus"]), 8)
+        for incorrect in (
+            output[:-len(b"NVIDIA A100-SXM4-40GB, 40536\n")],
+            output.replace(b"40536", b"23999", 1),
+            output.replace(b"NVIDIA A100-SXM4-40GB", b"RTX 3090", 1),
+        ):
+            with self.subTest(output=incorrect), patch("remote_job.run_command", return_value=incorrect):
+                with self.assertRaises(JobError):
+                    gpu_details("A100 SXM4", Deadline(10), 8)
 
     def test_cuda_bootstrap_pins_source_and_compiles_only_the_required_target(self):
         commands = []
@@ -114,6 +189,7 @@ class WorkerTests(WorkerFixture):
                 binary.write_text("SYNTHETIC_BINARY_FIXTURE")
 
         with patch("remote_job.gpu_details", return_value={"gpu_name": "A100", "gpu_vram_mib": 40536}), \
+             patch("remote_job.cuda_architectures", return_value="80") as architectures, \
              patch("remote_job.shutil.which", return_value="/fixture/tool"), \
              patch("remote_job.logged_command", side_effect=capture):
             result = bootstrap(self.root, {"gpu_name": "A100"}, Deadline(30))
@@ -122,9 +198,25 @@ class WorkerTests(WorkerFixture):
         self.assertTrue(any(LLAMA_COMMIT in args and "fetch" in args for args in commands))
         configure = next(args for args in commands if args[:2] == ["cmake", "-S"])
         self.assertIn("-DGGML_CUDA=ON", configure)
-        self.assertIn("-DCMAKE_CUDA_ARCHITECTURES=native", configure)
+        self.assertIn("-DCMAKE_CUDA_ARCHITECTURES=80", configure)
+        architectures.assert_called_once_with(1, unittest.mock.ANY)
         build = next(args for args in commands if args[:2] == ["cmake", "--build"])
         self.assertEqual(build[build.index("--target") + 1], "llama-server")
+
+    def test_cuda_build_architectures_use_every_actual_device_without_native(self):
+        with patch("remote_job.run_command", return_value=b"7.5\n8.0\n7.5\n10.0\n") as query:
+            self.assertEqual(cuda_architectures(4, Deadline(10)), "75;80;100")
+        self.assertIn("--query-gpu=compute_cap", query.call_args.args[0])
+        self.assertIn("--format=csv,noheader,nounits", query.call_args.args[0])
+
+    def test_invalid_or_partial_cuda_capabilities_fail_explicitly(self):
+        for output in (
+            b"", b"8.0\n", b"8.0\n8.0\n8.0\n", b"N/A\n8.0\n",
+            b"native\n8.0\n", b"75\n8.0\n", b"8.0;90\n8.0\n", b"8.12\n8.0\n",
+        ):
+            with self.subTest(output=output), patch("remote_job.run_command", return_value=output):
+                with self.assertRaises(JobError):
+                    cuda_architectures(2, Deadline(10))
 
     def test_template_without_cuda_toolkit_is_rejected_before_setup(self):
         with patch("remote_job.gpu_details", return_value={"gpu_name": "A100"}), \
@@ -133,6 +225,38 @@ class WorkerTests(WorkerFixture):
             with self.assertRaises(JobError):
                 bootstrap(self.root, {"gpu_name": "A100"}, Deadline(30))
             setup.assert_not_called()
+
+    def test_bare_cuda_template_installs_venv_before_creating_the_environment(self):
+        commands = []
+
+        def capture(args, root, deadline, context):
+            commands.append(args)
+            if args[:2] == ["cmake", "--build"]:
+                binary = root / "llama.cpp/build/bin/llama-server"
+                binary.parent.mkdir(parents=True)
+                binary.write_text("SYNTHETIC_BINARY_FIXTURE")
+
+        with patch("remote_job.gpu_details", return_value={"gpu_name": "A100"}), \
+             patch("remote_job.cuda_architectures", return_value="80"), \
+             patch("remote_job.shutil.which", return_value="/fixture/tool"), \
+             patch("remote_job.importlib.util.find_spec", return_value=None), \
+             patch("remote_job.os.geteuid", return_value=0), \
+             patch("remote_job.logged_command", side_effect=capture):
+            bootstrap(self.root, {"gpu_name": "A100"}, Deadline(30))
+        install = next(args for args in commands if args[:2] == ["apt-get", "install"])
+        self.assertEqual(install[-1], "python3-venv")
+        environment = next(args for args in commands if "-m" in args and "venv" in args)
+        self.assertLess(commands.index(install), commands.index(environment))
+
+    def test_missing_venv_without_install_privilege_fails_explicitly(self):
+        with patch("remote_job.gpu_details", return_value={"gpu_name": "A100"}), \
+             patch("remote_job.shutil.which", return_value="/fixture/tool"), \
+             patch("remote_job.importlib.util.find_spec", return_value=None), \
+             patch("remote_job.os.geteuid", return_value=1000), \
+             patch("remote_job.logged_command") as commands:
+            with self.assertRaisesRegex(JobError, "Python venv/ensurepip"):
+                bootstrap(self.root, {"gpu_name": "A100"}, Deadline(30))
+            commands.assert_not_called()
 
     def test_server_is_loopback_gpu_only_and_has_explicit_generation_capacity(self):
         args = server_args(Path("/fixture/server"), Path("/fixture/model.gguf"), 4096, 12345)
@@ -231,6 +355,9 @@ class LocalHttpInferenceTests(WorkerFixture):
         self.spawn_arguments = None
         self.spawn_environment = None
         self.layers = "33/33"
+        self.properties_status = 200
+        self.properties = {"total_slots": 1, "default_generation_settings": {"n_ctx": 4096}}
+        self.context_checks = []
         self.http_status = 200
         self.http_response = {
             "choices": [{"message": {"role": "assistant", "content": ANSWER}, "finish_reason": "stop"}],
@@ -257,10 +384,16 @@ class LocalHttpInferenceTests(WorkerFixture):
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
-                self.send_response(200)
+                if self.path == "/props":
+                    owner.context_checks.append(self.path)
+                    self.send_response(owner.properties_status)
+                    content = json.dumps(owner.properties).encode()
+                else:
+                    self.send_response(200)
+                    content = b'{"status":"ok"}'
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
-                self.wfile.write(b'{"status":"ok"}')
+                self.wfile.write(content)
 
             def do_POST(self):
                 payload = self.rfile.read(int(self.headers["Content-Length"]))
@@ -291,11 +424,11 @@ class LocalHttpInferenceTests(WorkerFixture):
             thread.join(timeout=5)
         process.poll.return_value = 0
 
-    def execute_inference(self):
+    def execute_inference(self, context_size=4096):
         request = {
             "hf_token": HF_TOKEN, "model": self.model, "gpu_name": "A100 SXM4",
             "prompt": "Literal 'quotes'; $(not-a-command)\nnext caf\u00e9",
-            "context_size": 4096, "max_tokens": 1024, "temperature": 0.7,
+            "context_size": context_size, "max_tokens": 1024, "temperature": 0.7,
         }
         with patch("remote_job.gpu_details",
                    return_value={"gpu_name": "NVIDIA A100-SXM4-40GB", "gpu_vram_mib": 40536}), \
@@ -327,6 +460,37 @@ class LocalHttpInferenceTests(WorkerFixture):
         self.assertNotIn("HF_TOKEN", self.spawn_environment)
         self.assertNotIn("VAST_AI_API_KEY", self.spawn_environment)
         self.assertNotIn(HF_TOKEN, " ".join(self.spawn_arguments))
+
+    def test_training_context_cap_is_rejected_before_sending_a_prompt(self):
+        self.properties["default_generation_settings"]["n_ctx"] = 32768
+        with self.assertRaisesRegex(JobError, "32768.*65536"):
+            self.execute_inference(context_size=65536)
+        self.assertEqual(self.context_checks, ["/props"])
+        self.assertEqual(self.requests, [])
+        self.assertFalse((self.root / "response.txt").exists())
+
+    def test_actual_larger_context_is_verified_before_generation(self):
+        self.properties["default_generation_settings"]["n_ctx"] = 65536
+        result = self.execute_inference(context_size=65536)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(self.context_checks, ["/props"])
+        self.assertEqual(len(self.requests), 1)
+        self.assertIn("single-slot context verified: 65536 tokens", (self.root / "remote.log").read_text())
+
+    def test_context_properties_errors_missing_capacity_and_extra_slots_never_generate(self):
+        for status, properties in (
+            (500, self.properties),
+            (200, {}),
+            (200, {"total_slots": 1, "default_generation_settings": {"n_ctx": True}}),
+            (200, {"total_slots": 2, "default_generation_settings": {"n_ctx": 4096}}),
+        ):
+            with self.subTest(status=status, properties=properties):
+                self.properties_status, self.properties = status, properties
+                with self.assertRaises(JobError):
+                    self.execute_inference()
+                self.assertEqual(self.requests, [])
+                self.servers.clear()
+                self.threads.clear()
 
     def test_pinned_runtime_trace_logging_confirms_gpu_before_generating(self):
         result = self.execute_inference()

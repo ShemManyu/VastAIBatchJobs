@@ -81,6 +81,27 @@ class ApiTests(unittest.TestCase):
                 with self.assertRaises(JobError):
                     client.template(DEFAULT_TEMPLATE_HASH, Deadline(10))
 
+    def test_official_cuda_version_tags_are_accepted_without_changing_the_default_pin(self):
+        template_hash = "5ec457ba5e023038cdcfe7d4aab5c207"
+        client, _ = self.client(Response({"templates": [{
+            "hash_id": template_hash, "image": "nvidia/cuda",
+            "tag": "12.4.1-devel-ubuntu22.04", "recommended_disk_space": 16,
+            "extra_filters": {"cpu_arch": {"in": ["amd64", "arm64"]}},
+        }]}))
+        template = client.template(template_hash, Deadline(10))
+        self.assertEqual(template.image, "nvidia/cuda:12.4.1-devel-ubuntu22.04")
+        self.assertEqual(template.cuda_version, 12.4)
+        self.assertEqual(template.recommended_disk, 16)
+
+    def test_a_numeric_tag_on_an_unrelated_repository_is_not_a_cuda_template(self):
+        template_hash = "5ec457ba5e023038cdcfe7d4aab5c207"
+        client, _ = self.client(Response({"templates": [{
+            "hash_id": template_hash, "image": "unrelated/image",
+            "tag": "12.4.1-devel-ubuntu22.04", "recommended_disk_space": 16,
+        }]}))
+        with self.assertRaisesRegex(JobError, "CUDA development template"):
+            client.template(template_hash, Deadline(10))
+
     def test_full_pages_are_followed_even_when_truncated_is_false(self):
         client, session = self.client(
             Response({"offers": [raw_offer(1, gpu_name="RTX 3090"), raw_offer(2, gpu_name="RTX 3090")],
@@ -106,6 +127,18 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(query["ask_contract_id"], {"eq": 9})
         self.assertNotIn("id", query)
         self.assertEqual([offer.id for offer in offers], [9])
+
+    def test_multi_gpu_filter_uses_exact_count_and_per_gpu_memory(self):
+        client, session = self.client(Response({"offers": [
+            raw_offer(1, num_gpus=4, dph_total=3),
+            raw_offer(2, num_gpus=8, dph_total=7.5),
+        ]}))
+        offers = client.offers(TEMPLATE, 64, 8, 11100, Deadline(10), gpu_count=8)
+        self.assertEqual(session.calls[0][2]["json"]["num_gpus"], {"eq": 8})
+        self.assertEqual([offer.id for offer in offers], [2])
+        self.assertEqual(offers[0].gpu_count, 8)
+        self.assertEqual(offers[0].gpu_ram_mb, 40960)
+        self.assertEqual(offers[0].summary()["total_gpu_ram_mb"], 327680)
 
     def test_server_filter_violation_does_not_rent_an_ineligible_gpu(self):
         cases = (

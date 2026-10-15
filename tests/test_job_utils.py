@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from job_utils import (
     Deadline, DeadlineExceeded, JobError, atomic_write, completion_text,
-    model_filename, number, redact, run_command, write_json,
+    model_filename, model_filenames, number, redact, run_command, write_json,
 )
 from tests.fakes import ANSWER, Clock, HF_TOKEN, VAST_TOKEN
 
@@ -40,6 +40,21 @@ class UtilityTests(unittest.TestCase):
                 model_filename(name)
         self.assertEqual(model_filename("subdir/8B-Q4_K_M.gguf"), "subdir/8B-Q4_K_M.gguf")
         self.assertEqual(model_filename("floral-8b.gguf"), "floral-8b.gguf")
+
+    def test_split_model_names_are_a_complete_ordered_safe_set(self):
+        self.assertEqual(model_filenames("quant/model-00001-of-00003.gguf"), [
+            "quant/model-00001-of-00003.gguf",
+            "quant/model-00002-of-00003.gguf",
+            "quant/model-00003-of-00003.gguf",
+        ])
+        self.assertEqual(model_filenames("model.gguf"), ["model.gguf"])
+        for name in (
+            "model-00002-of-00003.gguf", "model-00001-of-00001.gguf",
+            "model-00001-of-00129.gguf", "model-1-of-3.gguf",
+            "../model-00001-of-00003.gguf", "mmproj-model-00001-of-00003.gguf",
+        ):
+            with self.subTest(name=name), self.assertRaises(JobError):
+                model_filenames(name)
 
     def test_error_redaction_removes_secrets_and_signed_url_parameters(self):
         text = (

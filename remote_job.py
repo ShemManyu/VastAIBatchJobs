@@ -1,20 +1,24 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+import importlib.util
 import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 import signal
 import socket
 import subprocess
 import sys
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Iterator
 
 from job_utils import (
-    Deadline, DeadlineExceeded, JobError, LLAMA_COMMIT, MAX_WORKER_REQUEST_BYTES, atomic_write,
-    commit_sha, completion_text, error_text, model_filename, number,
+    ContextLimitError, Deadline, DeadlineExceeded, JobError, LLAMA_COMMIT, MAX_WORKER_REQUEST_BYTES, atomic_write,
+    commit_sha, completion_text, error_text, model_filenames, number,
     object_value, positive_int, redact, run_command, sha256_file,
     stop_process, write_json,
 )
@@ -28,30 +32,59 @@ def log(root: Path, message: str, token: str = "") -> None:
         file.write(redact(message, (token,)) + "\n")
 
 
-def gpu_details(expected: str, deadline: Deadline) -> dict[str, Any]:
+def gpu_details(expected: str, deadline: Deadline, expected_count: int = 1) -> dict[str, Any]:
+    positive_int(expected_count, "Expected GPU count")
     output = run_command(
         ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
         deadline, context="GPU verification",
     ).decode("utf-8")
     rows = [line.strip() for line in output.splitlines() if line.strip()]
-    if len(rows) != 1:
-        raise JobError("The instance must expose exactly one NVIDIA GPU.")
-    try:
-        name, memory = rows[0].rsplit(",", 1)
-        memory_mib = number(float(memory.strip()), "GPU memory", positive=True)
-    except ValueError as error:
-        raise JobError("Could not parse nvidia-smi GPU details.") from error
-    if not 24_000 <= memory_mib:
-        raise JobError("The remote GPU has less than the required 24 GB VRAM.")
+    if len(rows) != expected_count:
+        raise JobError(f"The instance must expose exactly {expected_count} NVIDIA GPU(s).")
 
     def canonical(value: str) -> str:
-        value = re.sub(r"\b(nvidia|geforce|tesla)\b", "", value, flags=re.IGNORECASE)
+        value = re.sub(r"^q(?=\s+rtx)", "", value, flags=re.IGNORECASE)
+        value = re.sub(r"\b(nvidia|geforce|tesla|quadro)\b", "", value, flags=re.IGNORECASE)
         value = re.sub(r"[-_ ]\d+gb(?:\b|_)", "", value, flags=re.IGNORECASE)
         return re.sub(r"[^a-z0-9]", "", value.lower())
 
-    if canonical(expected) not in canonical(name) or not canonical(expected):
-        raise JobError("The instance GPU does not match the selected offer.")
-    return {"gpu_name": name.strip(), "gpu_vram_mib": memory_mib}
+    devices = []
+    for row in rows:
+        try:
+            name, memory = row.rsplit(",", 1)
+            memory_mib = number(float(memory.strip()), "GPU memory", positive=True)
+        except ValueError as error:
+            raise JobError("Could not parse nvidia-smi GPU details.") from error
+        if memory_mib < 24_000:
+            raise JobError("A remote GPU has less than the required 24 GB VRAM.")
+        if canonical(expected) not in canonical(name) or not canonical(expected):
+            raise JobError("An instance GPU does not match the selected offer.")
+        devices.append({"gpu_name": name.strip(), "gpu_vram_mib": memory_mib})
+    return {
+        **devices[0],
+        **({
+            "gpu_count": expected_count,
+            "gpu_vram_total_mib": sum(item["gpu_vram_mib"] for item in devices),
+            "gpus": devices,
+        } if expected_count > 1 else {}),
+    }
+
+
+def cuda_architectures(expected_count: int, deadline: Deadline) -> str:
+    positive_int(expected_count, "Expected GPU count")
+    output = run_command(
+        ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader,nounits"],
+        deadline, context="CUDA architecture verification",
+    ).decode("utf-8")
+    capabilities = [line.strip() for line in output.splitlines() if line.strip()]
+    if len(capabilities) != expected_count:
+        raise JobError("CUDA compute capabilities do not cover every allocated GPU.")
+    architectures = set()
+    for capability in capabilities:
+        if re.fullmatch(r"[1-9][0-9]*\.[0-9]", capability) is None:
+            raise JobError("Could not parse an allocated GPU's CUDA compute capability.")
+        architectures.add(capability.replace(".", ""))
+    return ";".join(sorted(architectures, key=int))
 
 
 def logged_command(args: list[str], root: Path, deadline: Deadline, context: str) -> None:
@@ -80,18 +113,29 @@ def bootstrap(root: Path, request: dict[str, Any], deadline: Deadline) -> dict[s
     expected_gpu = request.get("gpu_name")
     if not isinstance(expected_gpu, str):
         raise JobError("Expected GPU name is missing.")
-    gpu = gpu_details(expected_gpu, deadline)
+    gpu_count = positive_int(request.get("gpu_count", 1), "GPU count")
+    gpu = gpu_details(expected_gpu, deadline, gpu_count)
     if shutil.which("nvcc") is None:
         raise JobError("The template must include the CUDA development toolkit (nvcc).")
     missing = [tool for tool in ("git", "cmake", "g++") if shutil.which(tool) is None]
-    if missing:
+    missing_venv = importlib.util.find_spec("ensurepip") is None
+    if missing or missing_venv:
         if os.geteuid() != 0 or shutil.which("apt-get") is None:
-            raise JobError(f"The CUDA template is missing build tools: {', '.join(missing)}.")
+            prerequisites = missing + (["Python venv/ensurepip"] if missing_venv else [])
+            raise JobError(f"The CUDA template is missing prerequisites: {', '.join(prerequisites)}.")
         logged_command(["apt-get", "update", "-qq"], root, deadline, "Updating build dependencies")
+        packages = ["git", "cmake", "build-essential"] if missing else []
+        if missing_venv:
+            packages.append("python3-venv")
         logged_command(
-            ["apt-get", "install", "-y", "-qq", "git", "cmake", "build-essential"],
+            ["apt-get", "install", "-y", "-qq", *packages],
             root, deadline, "Installing missing build dependencies",
         )
+    if request.get("agent") is True:
+        from agent_job import bootstrap_tools
+
+        log(root, "Installing pinned Node and checking agent isolation prerequisites.")
+        bootstrap_tools(root, deadline)
     virtualenv = root / "venv"
     logged_command(
         [sys.executable, "-m", "venv", str(virtualenv)],
@@ -115,9 +159,10 @@ def bootstrap(root: Path, request: dict[str, Any], deadline: Deadline) -> dict[s
     ):
         logged_command(args, root, deadline, context)
     build = source / "build"
+    architectures = cuda_architectures(gpu_count, deadline)
     logged_command(
         ["cmake", "-S", str(source), "-B", str(build), "-DGGML_CUDA=ON",
-         "-DCMAKE_CUDA_ARCHITECTURES=native", "-DCMAKE_BUILD_TYPE=Release",
+         f"-DCMAKE_CUDA_ARCHITECTURES={architectures}", "-DCMAKE_BUILD_TYPE=Release",
          "-DLLAMA_BUILD_TESTS=OFF", "-DLLAMA_BUILD_EXAMPLES=OFF",
          "-DLLAMA_BUILD_SERVER=ON", "-DLLAMA_BUILD_APP=OFF",
          "-DLLAMA_USE_PREBUILT_UI=OFF", "-DLLAMA_OPENSSL=OFF"],
@@ -143,38 +188,54 @@ def download_model(
     repo = model.get("repo")
     if not isinstance(repo, str) or not repo:
         raise JobError("Model repository is missing.")
-    filename = model_filename(model.get("filename"))
+    filenames = model_filenames(model.get("filename"))
     revision = commit_sha(model.get("revision"))
     expected_size = positive_int(model.get("size_bytes"), "Model size")
+    files = model.get("files")
+    if files is None and len(filenames) == 1:
+        files = [model]
+    if (
+        not isinstance(files, list) or len(files) != len(filenames)
+        or any(not isinstance(item, dict) for item in files)
+        or [item.get("filename") for item in files] != filenames
+    ):
+        raise JobError("GGUF shard metadata must list the complete ordered set.")
+    sizes = [positive_int(item.get("size_bytes"), "GGUF shard size") for item in files]
+    if sum(sizes) != expected_size:
+        raise JobError("Total model size does not match its GGUF shard metadata.")
+    for item in files:
+        digest = item.get("sha256")
+        if (len(files) > 1 and digest is None) or (
+            digest is not None and (not isinstance(digest, str) or not re.fullmatch(r"[a-f0-9]{64}", digest))
+        ):
+            raise JobError("Invalid or missing GGUF shard SHA-256 metadata.")
     if shutil.disk_usage(root).free < expected_size + 2 * 1024 ** 3:
         raise JobError("Insufficient free disk for the model and inference artifacts.")
-    log(root, "Downloading the selected GGUF inside the instance.", token)
-    try:
-        downloaded = hf_hub_download(
-            repo_id=repo, filename=filename, revision=revision, token=token,
-            local_dir=root / "models", etag_timeout=deadline.timeout(),
-        )
-    except (OSError, ValueError, RuntimeError) as error:
-        raise JobError(f"GGUF download failed: {error_text(error, (token,))}") from error
-    if not isinstance(downloaded, str):
-        raise JobError("Hugging Face did not return a downloaded model path.")
-    path = Path(downloaded).resolve()
-    if path != (root / "models" / filename).resolve():
-        raise JobError("Downloaded model is outside the requested job directory.")
-    if path.stat().st_size != expected_size:
-        raise JobError("Downloaded GGUF size does not match authenticated metadata.")
-    with path.open("rb") as file:
-        if file.read(4) != b"GGUF":
-            raise JobError("Downloaded file is not a GGUF model.")
-    expected_hash = model.get("sha256")
-    if expected_hash is not None:
-        if not isinstance(expected_hash, str) or not re.fullmatch(r"[a-f0-9]{64}", expected_hash):
-            raise JobError("Invalid model SHA-256 metadata.")
-        if sha256_file(path, deadline) != expected_hash:
+    for index, item in enumerate(files, 1):
+        filename = item["filename"]
+        log(root, f"Downloading GGUF file {index}/{len(files)} inside the instance.", token)
+        try:
+            downloaded = hf_hub_download(
+                repo_id=repo, filename=filename, revision=revision, token=token,
+                local_dir=root / "models", etag_timeout=deadline.timeout(),
+            )
+        except (OSError, ValueError, RuntimeError) as error:
+            raise JobError(f"GGUF download failed: {error_text(error, (token,))}") from error
+        if not isinstance(downloaded, str):
+            raise JobError("Hugging Face did not return a downloaded model path.")
+        path = Path(downloaded).resolve()
+        if path != (root / "models" / filename).resolve():
+            raise JobError("Downloaded model is outside the requested job directory.")
+        if path.stat().st_size != item["size_bytes"]:
+            raise JobError("Downloaded GGUF size does not match authenticated metadata.")
+        with path.open("rb") as file:
+            if file.read(4) != b"GGUF":
+                raise JobError("Downloaded file is not a GGUF model.")
+        if item.get("sha256") is not None and sha256_file(path, deadline) != item["sha256"]:
             raise JobError("Downloaded GGUF SHA-256 does not match authenticated metadata.")
-    deadline.remaining()
+        deadline.remaining()
     log(root, "GGUF download and integrity checks complete.", token)
-    return path
+    return (root / "models" / filenames[0]).resolve()
 
 
 def wait_for_server(
@@ -208,14 +269,50 @@ def wait_for_server(
         deadline.sleep(1)
 
 
-def server_args(binary: Path, model: Path, context_size: int, port: int) -> list[str]:
+def verify_server_context(http: requests.Session, url: str, requested: int, deadline: Deadline) -> int:
+    import requests
+
+    timeout = deadline.timeout(5)
+    try:
+        response = http.get(
+            f"{url}/props", timeout=(timeout / 2, timeout / 2), allow_redirects=False,
+        )
+    except requests.RequestException as error:
+        raise JobError(f"llama-server context check failed ({type(error).__name__}).") from error
+    if response.status_code != 200:
+        raise JobError(f"llama-server context check failed: HTTP {response.status_code}.")
+    try:
+        properties = object_value(response.json(), "Model properties")
+    except ValueError as error:
+        raise JobError("llama-server returned invalid context properties JSON.") from error
+    slots = positive_int(properties.get("total_slots"), "Model slot count")
+    defaults = object_value(properties.get("default_generation_settings"), "Model generation settings")
+    available = positive_int(defaults.get("n_ctx"), "Effective model context")
+    if slots != 1:
+        raise JobError("llama-server must provide exactly one job-owned context slot.")
+    if available < requested:
+        raise JobError(
+            f"llama-server serves {available} context tokens, below the requested {requested}. "
+            "The pinned runtime caps slots to the model's training context; choose a "
+            "longer-context GGUF or lower --context-size."
+        )
+    deadline.remaining()
+    return available
+
+
+def server_args(
+    binary: Path, model: Path, context_size: int, port: int, api_key_file: Path | None = None,
+) -> list[str]:
     # The pinned runtime maps loader INFO messages to trace verbosity.
-    return [
+    args = [
         str(binary), "--model", str(model), "--host", "127.0.0.1", "--port", str(port),
         "--ctx-size", str(context_size), "--parallel", "1", "--n-gpu-layers", "all",
         "--fit", "off", "--no-context-shift", "--alias", "batch-model",
         "--offline", "--log-colors", "off", "--verbosity", "4",
     ]
+    if api_key_file is not None:
+        args.extend(["--api-key-file", str(api_key_file), "--no-agent", "--no-webui"])
+    return args
 
 
 def wait_for_gpu_offload(
@@ -244,7 +341,79 @@ def wait_for_gpu_offload(
             deadline.sleep(min(0.1, remaining))
 
 
-def infer(root: Path, request: dict[str, Any], deadline: Deadline) -> dict[str, Any]:
+def request_secrets(request: dict[str, Any]) -> tuple[str, ...]:
+    token = request.get("hf_token")
+    task_env = request.get("task_env", {})
+    values = [token] if isinstance(token, str) else []
+    if isinstance(task_env, dict):
+        values.extend(value for value in task_env.values() if isinstance(value, str))
+    return tuple(values)
+
+
+@dataclass
+class ModelRuntime:
+    http: requests.Session
+    url: str
+    gpu: dict[str, Any]
+    context_size: int
+    max_tokens: int
+    temperature: float
+    secrets: tuple[str, ...] = field(repr=False)
+
+    def post(self, path: str, payload: dict[str, Any], deadline: Deadline) -> dict[str, Any]:
+        import requests
+
+        remaining = deadline.remaining()
+        connect_timeout = min(5, remaining / 2)
+        try:
+            response = self.http.post(
+                self.url + path, json=payload,
+                timeout=(connect_timeout, remaining - connect_timeout), allow_redirects=False,
+            )
+        except requests.RequestException as error:
+            raise JobError(f"Model request failed: {error_text(error, self.secrets)}") from error
+        try:
+            result = object_value(response.json(), "Model response")
+        except ValueError as error:
+            raise JobError("Model returned invalid response JSON.") from error
+        if response.status_code != 200:
+            detail = redact(str(result.get("error", "Inference rejected")), self.secrets)
+            raise JobError(f"Model request failed: HTTP {response.status_code}, {detail[:1000]}")
+        deadline.remaining()
+        return result
+
+    def complete(
+        self, messages: list[dict[str, str]], schema: dict[str, Any] | None, deadline: Deadline,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "model": "batch-model", "messages": messages,
+            "max_tokens": self.max_tokens, "temperature": self.temperature, "stream": False,
+        }
+        if schema is not None:
+            rendered = self.post("/apply-template", {"messages": messages}, deadline)
+            prompt = rendered.get("prompt")
+            if not isinstance(prompt, str) or not prompt:
+                raise JobError("Model returned no rendered agent prompt.")
+            tokenized = self.post(
+                "/tokenize", {"content": prompt, "add_special": False, "parse_special": True}, deadline,
+            )
+            tokens = tokenized.get("tokens")
+            if not isinstance(tokens, list) or not tokens or any(
+                isinstance(token, bool) or not isinstance(token, int) or token < 0 for token in tokens
+            ):
+                raise JobError("Model returned invalid agent context token counts.")
+            if len(tokens) + self.max_tokens > self.context_size:
+                raise ContextLimitError(len(tokens), self.max_tokens, self.context_size)
+            payload["response_format"] = {"type": "json_object", "schema": schema}
+        completion = self.post("/v1/chat/completions", payload, deadline)
+        completion_text(completion)
+        return completion
+
+
+@contextmanager
+def model_runtime(
+    root: Path, request: dict[str, Any], deadline: Deadline, *, agent: bool = False,
+) -> Iterator[ModelRuntime]:
     import requests
 
     token = request.get("hf_token")
@@ -261,7 +430,7 @@ def infer(root: Path, request: dict[str, Any], deadline: Deadline) -> dict[str, 
     temperature = number(request.get("temperature"), "Temperature")
     if max_tokens >= context_size or not 0 <= temperature <= 2:
         raise JobError("Output limit must be below context size; temperature must be between 0 and 2.")
-    gpu = gpu_details(expected_gpu, deadline)
+    gpu = gpu_details(expected_gpu, deadline, positive_int(request.get("gpu_count", 1), "GPU count"))
     model = download_model(
         root, object_value(request.get("model"), "Model configuration"), token, deadline,
     )
@@ -276,63 +445,95 @@ def infer(root: Path, request: dict[str, Any], deadline: Deadline) -> dict[str, 
         key: value for key, value in os.environ.items()
         if "TOKEN" not in key.upper() and "API_KEY" not in key.upper()
     }
-    log(root, "Loading the GGUF into the CUDA runtime.", token)
-    with (root / "remote.log").open("ab") as output:
-        log_offset = output.tell()
-        process = subprocess.Popen(
-            server_args(binary, model, context_size, port),
-            stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
-            env=environment, start_new_session=True,
-        )
-        http = requests.Session()
-        http.trust_env = False
-        try:
-            wait_for_server(process, url, deadline, http)
-            wait_for_gpu_offload(process, root / "remote.log", log_offset, deadline)
-            remaining = deadline.remaining()
-            connect_timeout = min(5, remaining / 2)
+    protected_key = secrets.token_urlsafe(32) if agent else ""
+    api_key_file = root / "llama-api-key" if agent else None
+    if api_key_file is not None:
+        atomic_write(api_key_file, (protected_key + "\n").encode())
+    try:
+        log(root, "Loading the GGUF into the CUDA runtime.", token)
+        with (root / "remote.log").open("ab") as output:
+            log_offset = output.tell()
+            http = requests.Session()
+            http.trust_env = False
+            if protected_key:
+                http.headers["Authorization"] = f"Bearer {protected_key}"
+            process = None
             try:
-                response = http.post(
-                    f"{url}/v1/chat/completions",
-                    json={
-                        "model": "batch-model", "messages": [{"role": "user", "content": prompt}],
-                        "max_tokens": max_tokens, "temperature": temperature, "stream": False,
-                    },
-                    timeout=(connect_timeout, remaining - connect_timeout),
-                    allow_redirects=False,
+                process = subprocess.Popen(
+                    server_args(binary, model, context_size, port, api_key_file),
+                    stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
+                    env=environment, start_new_session=True,
                 )
-            except requests.RequestException as error:
-                raise JobError(f"Model request failed: {error_text(error, (token,))}") from error
-            try:
-                completion = object_value(response.json(), "Completion response")
-            except ValueError as error:
-                raise JobError("Model returned invalid completion JSON.") from error
-            if response.status_code != 200:
-                detail = redact(str(completion.get("error", "Inference rejected")), (token,))
-                raise JobError(f"Model request failed: HTTP {response.status_code}, {detail[:1000]}")
-            content = completion_text(completion)
-            deadline.remaining()
-            atomic_write(root / "response.txt", content.encode("utf-8"))
-            write_json(root / "completion.json", completion)
-            result = {
-                "status": "completed", "llama_commit": LLAMA_COMMIT, **gpu,
-                "response_sha256": sha256_file(root / "response.txt", deadline),
-                "completion_sha256": sha256_file(root / "completion.json", deadline),
-                "finish_reason": completion["choices"][0]["finish_reason"],
-                "usage": completion.get("usage"),
-            }
-            log(root, "Inference complete; response artifacts are ready for retrieval.", token)
-            return result
-        finally:
-            try:
-                http.close()
+                wait_for_server(process, url, deadline, http)
+                wait_for_gpu_offload(process, root / "remote.log", log_offset, deadline)
+                available = verify_server_context(http, url, context_size, deadline)
+                log(root, f"llama-server single-slot context verified: {available} tokens.", token)
+                yield ModelRuntime(
+                    http, url, gpu, context_size, max_tokens, temperature,
+                    (*request_secrets(request), protected_key),
+                )
             finally:
-                stop_process(process)
+                try:
+                    http.close()
+                finally:
+                    if process is not None:
+                        stop_process(process)
+    finally:
+        if api_key_file is not None:
+            api_key_file.unlink(missing_ok=True)
+
+
+def infer(root: Path, request: dict[str, Any], deadline: Deadline) -> dict[str, Any]:
+    with model_runtime(root, request, deadline) as runtime:
+        completion = runtime.complete([{"role": "user", "content": request["prompt"]}], None, deadline)
+        content = completion_text(completion)
+        deadline.remaining()
+        atomic_write(root / "response.txt", content.encode("utf-8"))
+        write_json(root / "completion.json", completion)
+        result = {
+            "status": "completed", "llama_commit": LLAMA_COMMIT, **runtime.gpu,
+            "response_sha256": sha256_file(root / "response.txt", deadline),
+            "completion_sha256": sha256_file(root / "completion.json", deadline),
+            "finish_reason": completion["choices"][0]["finish_reason"],
+            "usage": completion.get("usage"),
+        }
+        log(root, "Inference complete; response artifacts are ready for retrieval.", request["hf_token"])
+        return result
+
+
+def agent(root: Path, request: dict[str, Any], deadline: Deadline) -> dict[str, Any]:
+    from agent_job import Sandbox, run_agent
+    from agent_utils import AgentOptions
+
+    options = object_value(request.get("agent"), "Agent configuration")
+    settings = AgentOptions(
+        max_steps=positive_int(options.get("max_steps"), "Agent step limit"),
+        command_timeout_seconds=number(options.get("command_timeout_seconds"), "Command timeout", positive=True),
+        max_artifact_bytes=positive_int(options.get("max_artifact_bytes"), "Artifact byte limit"),
+        verification_code=options.get("verification_code"),
+    )
+    settings.validate()
+    if options.get("verification_sha256") != settings.public()["verification_sha256"]:
+        raise JobError("Verification script snapshot does not match its checksum.")
+    environment = object_value(request.get("task_env", {}), "Task environment")
+    if any(not isinstance(value, str) for value in environment.values()):
+        raise JobError("Task environment values must be strings.")
+    with model_runtime(root, request, deadline, agent=True) as runtime:
+        sandbox = Sandbox(root, settings, environment, runtime.secrets)
+        inputs = request.get("inputs")
+        sandbox.prepare(deadline, object_value(inputs, "Input bundle") if inputs is not None else None)
+        log(root, "Running the bounded non-root agent loop.", request["hf_token"])
+        result = run_agent(
+            root, request["prompt"], settings, sandbox, runtime.complete,
+            deadline, runtime.gpu, runtime.secrets,
+        )
+        log(root, f"Agent finished with status {result['status']} after {result['steps']} decisions.", request["hf_token"])
+        return result
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="VastAI remote GGUF worker")
-    parser.add_argument("stage", choices=("bootstrap", "infer"))
+    parser.add_argument("stage", choices=("bootstrap", "infer", "agent"))
     args = parser.parse_args(argv)
     root = Path(__file__).resolve().parent
     request: dict[str, Any] = {}
@@ -348,15 +549,12 @@ def main(argv: list[str] | None = None) -> int:
             raise JobError("Inference request exceeds the 8 MiB protocol limit.")
         request = object_value(json.loads(data), "Worker request")
         deadline = Deadline(number(request.get("remaining_seconds"), "Remaining time", positive=True))
-        result = (
-            bootstrap(root, request, deadline) if args.stage == "bootstrap"
-            else infer(root, request, deadline)
-        )
+        stages = {"bootstrap": bootstrap, "infer": infer, "agent": agent}
+        result = stages[args.stage](root, request, deadline)
         print(json.dumps(result, ensure_ascii=False, allow_nan=False))
         return 0
     except (JobError, OSError, ValueError, RuntimeError) as error:
-        token = request.get("hf_token")
-        message = error_text(error, (token,) if isinstance(token, str) else ())
+        message = error_text(error, request_secrets(request))
         print(json.dumps({"status": "failed", "error": message}))
         print(message, file=sys.stderr)
         return 1
