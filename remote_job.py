@@ -42,7 +42,8 @@ def gpu_details(expected: str, deadline: Deadline, expected_count: int = 1) -> d
         raise JobError(f"The instance must expose exactly {expected_count} NVIDIA GPU(s).")
 
     def canonical(value: str) -> str:
-        value = re.sub(r"\b(nvidia|geforce|tesla)\b", "", value, flags=re.IGNORECASE)
+        value = re.sub(r"^q(?=\s+rtx)", "", value, flags=re.IGNORECASE)
+        value = re.sub(r"\b(nvidia|geforce|tesla|quadro)\b", "", value, flags=re.IGNORECASE)
         value = re.sub(r"[-_ ]\d+gb(?:\b|_)", "", value, flags=re.IGNORECASE)
         return re.sub(r"[^a-z0-9]", "", value.lower())
 

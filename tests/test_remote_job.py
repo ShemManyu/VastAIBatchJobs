@@ -150,6 +150,8 @@ class WorkerTests(WorkerFixture):
             self.assertEqual(gpu_details("A100 SXM4", Deadline(10))["gpu_vram_mib"], 40536)
         with patch("remote_job.run_command", return_value=b"NVIDIA A100 80GB PCIe, 81920\n"):
             self.assertEqual(gpu_details("A100_PCIE_80GB", Deadline(10))["gpu_vram_mib"], 81920)
+        with patch("remote_job.run_command", return_value=b"Quadro RTX 8000, 49152\n"):
+            self.assertEqual(gpu_details("Q RTX 8000", Deadline(10))["gpu_vram_mib"], 49152)
         for output in (
             b"RTX 3090, 24576\n", b"NVIDIA A100-SXM4-40GB, 23999\n",
             b"NVIDIA A100-SXM4-40GB, nan\n", b"NVIDIA A100-SXM4-40GB, inf\n",
