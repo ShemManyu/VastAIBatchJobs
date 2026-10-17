@@ -222,6 +222,8 @@ modeloutput/<run-id>/
 
 The controller retrieves files over SSH/SCP, verifies checksums and agreement between text and completion, then publishes each final artifact atomically. There is no mount of your local filesystem on the GPU instance. Earlier runs are preserved. A `length` finish reason produces an explicit truncation warning.
 
+Idempotent SCP uploads and retrievals retry closed, reset, or refused connections up to three attempts within the original deadline, logging each retry. Permission, missing-file, SFTP-subsystem and host-key failures stop immediately. Remote commands and inference stages are not replayed.
+
 Successful execution exits `0` only after the response is retrieved **and destruction is confirmed**. Failures exit nonzero. A valid local response is preserved even if subsequent cleanup fails. Diagnostic logs are retrieved when possible; unavailable logs produce a warning.
 
 ## Cleanup and interrupted runs

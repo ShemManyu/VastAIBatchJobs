@@ -725,6 +725,74 @@ class ConfigAndTransportTests(unittest.TestCase):
             self.assertIn("StrictHostKeyChecking=accept-new", arguments)
             self.assertNotIn("apt-get", " ".join(arguments))
 
+    def test_scp_connection_failures_retry_only_idempotent_transfers(self):
+        for operation in ("worker", "agent", "fetch"):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                state = RunState(root, root, {"run_id": "20261009T000000Z-aaaaaaaaaaaa", "warnings": []},
+                                 Credentials(VAST_TOKEN, HF_TOKEN))
+                transport = SSHTransport(state, Endpoint("unit.invalid", 2222))
+                clock = Clock()
+                deadline = clock.deadline(20)
+                attempts = []
+
+                def execute(args, deadline, **kwargs):
+                    if args[0] == "scp":
+                        attempts.append(args)
+                        self.assertEqual(kwargs["secrets"], (VAST_TOKEN, HF_TOKEN))
+                        if len(attempts) < 3:
+                            raise JobError("scp: Connection closed")
+                    return b""
+
+                with patch("run_job.run_command", side_effect=execute), patch.object(state, "log") as log:
+                    if operation == "worker":
+                        transport.upload(deadline)
+                    elif operation == "agent":
+                        transport.upload_agent(None, deadline)
+                    else:
+                        transport.fetch("remote.log", root / "remote.log.part", deadline)
+                self.assertEqual(len(attempts), 3)
+                self.assertTrue(all(args == attempts[0] for args in attempts))
+                self.assertEqual(log.call_count, 2)
+                self.assertEqual(clock.value, 3)
+                self.assertIn("StrictHostKeyChecking=accept-new", attempts[0])
+
+    def test_scp_retries_are_bounded_and_permanent_failures_stop_immediately(self):
+        for message, count, error_type in (
+            ("scp: Connection reset by peer", 3, JobError),
+            ("Permission denied (publickey). scp: Connection closed", 1, JobError),
+            ("scp: No such file or directory", 1, JobError),
+            ("Host key verification failed. scp: Connection closed", 1, run_job.HostKeyError),
+        ):
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                state = RunState(root, root, {"run_id": "20261009T000000Z-aaaaaaaaaaaa", "warnings": []},
+                                 Credentials(VAST_TOKEN, HF_TOKEN))
+                transport = SSHTransport(state, Endpoint("unit.invalid", 2222))
+                with patch("run_job.run_command", side_effect=JobError(message)) as command, \
+                     patch.object(state, "log"):
+                    with self.assertRaises(error_type):
+                        transport.fetch("remote.log", root / "remote.log.part", Clock().deadline(20))
+                self.assertEqual(command.call_count, count)
+
+    def test_scp_retry_cannot_extend_deadline_or_replay_remote_stages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = RunState(root, root, {"run_id": "20261009T000000Z-aaaaaaaaaaaa", "warnings": []},
+                             Credentials(VAST_TOKEN, HF_TOKEN))
+            transport = SSHTransport(state, Endpoint("unit.invalid", 2222))
+            clock = Clock()
+            with patch("run_job.run_command", side_effect=JobError("scp: Connection closed")) as command, \
+                 patch.object(state, "log"):
+                with self.assertRaises(run_job.DeadlineExceeded):
+                    transport.fetch("remote.log", root / "remote.log.part", clock.deadline(.5))
+                self.assertEqual(command.call_count, 1)
+            self.assertEqual(clock.value, .5)
+            with patch("run_job.run_command", side_effect=JobError("Connection closed")) as command:
+                with self.assertRaises(JobError):
+                    transport.command("owned-worker-stage", Clock().deadline(20))
+                self.assertEqual(command.call_count, 1)
+
     def test_help_does_not_read_credentials_or_contact_providers(self):
         with patch("run_job.credentials_from_file") as credentials, redirect_stdout(io.StringIO()):
             with self.assertRaises(SystemExit) as caught:

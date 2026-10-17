@@ -442,23 +442,47 @@ class SSHTransport:
     def probe(self, deadline: Deadline) -> None:
         self.command("true", deadline)
 
+    def _copy(self, args: list[str], deadline: Deadline, *, context: str) -> None:
+        for attempt in range(3):
+            deadline.remaining()
+            try:
+                run_command(args, deadline, secrets=self.state.credentials.secrets, context=context)
+                return
+            except (HostKeyError, DeadlineExceeded):
+                raise
+            except JobError as error:
+                message = error_text(error, self.state.credentials.secrets)
+                lowered = message.lower()
+                if "host key verification failed" in lowered or "remote host identification has changed" in lowered:
+                    raise HostKeyError("SSH host key changed or could not be verified; refusing SCP.") from error
+                permanent = any(text in lowered for text in (
+                    "permission denied", "no such file", "not a regular file", "subsystem request failed",
+                ))
+                transient = any(text in lowered for text in (
+                    "connection closed", "connection reset", "connection refused",
+                ))
+                if attempt == 2 or permanent or not transient:
+                    raise
+                self.state.log(f"{context}: {message}; retry {attempt + 1}/2.")
+                deadline.sleep(2 ** attempt)
+
     def upload(self, deadline: Deadline) -> None:
         self.command(f"mkdir -m 700 -p {shlex.quote(self.remote_dir)}", deadline)
-        run_command(
+        self._copy(
             ["scp", "-q", *self.options(deadline), "-P", str(self.endpoint.port),
              str(ROOT / "remote_job.py"), str(ROOT / "job_utils.py"),
              str(ROOT / "requirements.txt"), self.endpoint.scp_path(self.remote_dir + "/")],
-            deadline, secrets=self.state.credentials.secrets, context="Uploading remote worker",
+            deadline, context="Uploading remote worker",
         )
 
     def upload_agent(self, inputs: Path | None, deadline: Deadline) -> None:
         files = [ROOT / name for name in ("agent_job.py", "agent_tools.py", "agent_utils.py")]
         if inputs is not None:
             files.append(inputs)
-        run_command(
+        self._copy(
             ["scp", "-q", *self.options(deadline), "-P", str(self.endpoint.port),
              *(str(path) for path in files), self.endpoint.scp_path(self.remote_dir + "/")],
-            deadline, secrets=self.state.credentials.secrets, context="Uploading agent tools and inputs",
+            deadline, context="Uploading agent tools and inputs",
         )
 
     def invoke(self, stage: str, request: dict[str, Any], deadline: Deadline) -> dict[str, Any]:
@@ -497,10 +521,10 @@ class SSHTransport:
             "agent-transcript.json", "artifacts.tar",
         ):
             raise JobError("Invalid remote artifact name.")
-        run_command(
+        self._copy(
             ["scp", "-q", *self.options(deadline), "-P", str(self.endpoint.port),
              self.endpoint.scp_path(f"{self.remote_dir}/{filename}"), str(destination)],
-            deadline, secrets=self.state.credentials.secrets, context=f"Retrieving {filename}",
+            deadline, context=f"Retrieving {filename}",
         )
 
 
