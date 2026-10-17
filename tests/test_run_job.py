@@ -302,6 +302,45 @@ class WorkflowTests(unittest.TestCase):
                         self.execute(client, settings=settings)
                 self.assertEqual(client.created, 0)
 
+    def test_download_cap_boundary_combines_with_bidirectional_cap(self):
+        client = FakeClient()
+        valid = replace(client.offer, download_cost_per_gb=.00261, upload_cost_per_gb=.00521)
+        settings = replace(self.settings, max_download_price=.00261, max_bandwidth_price=.00521)
+        self.assertEqual(run_job.select_offer(settings, [valid]), valid)
+        with patch.object(client, "offers", return_value=[valid]):
+            state = self.execute(client, settings=settings)
+        self.assertEqual(state.data["settings"]["max_download_price_per_gb_usd"], .00261)
+        for offer in (
+            replace(valid, download_cost_per_gb=.002610001),
+            replace(valid, upload_cost_per_gb=.005210001),
+        ):
+            with self.subTest(offer=offer), self.assertRaises(JobError):
+                run_job.select_offer(settings, [offer])
+        free = replace(valid, download_cost_per_gb=0)
+        self.assertEqual(run_job.select_offer(replace(settings, max_download_price=0), [free]), free)
+        self.assertEqual(run_job.select_offer(self.settings, [valid]), valid)
+
+    def test_download_cap_is_revalidated_before_creation(self):
+        for download_price in (.002610001, .00521):
+            with self.subTest(download_price=download_price):
+                client = FakeClient()
+                valid = replace(client.offer, download_cost_per_gb=.00261, upload_cost_per_gb=.00521)
+                increased = replace(valid, download_cost_per_gb=download_price)
+                settings = replace(self.settings, max_download_price=.00261, max_bandwidth_price=.00521)
+                with patch.object(client, "offers", side_effect=[[valid], [increased]]) as search:
+                    with self.assertRaises(JobError):
+                        self.execute(client, settings=settings)
+                self.assertEqual(search.call_count, 2)
+                self.assertEqual(client.created, 0)
+
+    def test_invalid_download_prices_never_rent(self):
+        for value in (-.001, float("nan"), float("inf"), True):
+            with self.subTest(value=value):
+                client = FakeClient()
+                with self.assertRaises(JobError):
+                    self.execute(client, settings=replace(self.settings, max_download_price=value))
+                self.assertEqual(client.created, 0)
+
     def test_hugging_face_access_denial_happens_before_rental(self):
         client = FakeClient()
         with patch("run_job.shutil.which", return_value="/fixture/tool"), \
@@ -456,7 +495,8 @@ class WorkflowTests(unittest.TestCase):
 
     def test_cli_offer_override_controls_the_actual_dry_run_selection(self):
         client = FakeClient()
-        requested = replace(client.offer, id=20, hourly_price=2)
+        requested = replace(client.offer, id=20, hourly_price=2,
+                            download_cost_per_gb=.00261, upload_cost_per_gb=.00521)
         stdout = io.StringIO()
         env = self.base / ".env"
         env.write_text(f"VAST_AI_API_KEY={VAST_TOKEN}\nHUGGING_FACE_ACCESS_TOKEN={HF_TOKEN}\n")
@@ -465,11 +505,13 @@ class WorkflowTests(unittest.TestCase):
              patch.object(client, "offers", return_value=[client.offer, requested]) as search, \
              patch("run_job.inspect_model", return_value=dict(MODEL)), redirect_stdout(stdout):
             result = main(["run", "--model-repo", "unit/model", "--model-file", "model-Q4_K_M.gguf",
-                           "--prompt", "test", "--offer-id", "20", "--dry-run"])
+                           "--prompt", "test", "--offer-id", "20", "--max-download-price", ".00261",
+                           "--max-bandwidth-price", ".00521", "--dry-run"])
         self.assertEqual(result, 0)
         preview = json.loads(stdout.getvalue())
         self.assertEqual(preview["selected_offer"]["offer_id"], 20)
         self.assertEqual(preview["limits"]["requested_offer_id"], 20)
+        self.assertEqual(preview["limits"]["max_download_price_per_gb_usd"], .00261)
         self.assertEqual(search.call_args.kwargs["offer_id"], 20)
         self.assertEqual(client.created, 0)
         self.assertFalse((self.base / ".vastai-runs").exists())
@@ -682,6 +724,74 @@ class ConfigAndTransportTests(unittest.TestCase):
             self.assertNotIn(VAST_TOKEN, json.dumps(payload))
             self.assertIn("StrictHostKeyChecking=accept-new", arguments)
             self.assertNotIn("apt-get", " ".join(arguments))
+
+    def test_scp_connection_failures_retry_only_idempotent_transfers(self):
+        for operation in ("worker", "agent", "fetch"):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                state = RunState(root, root, {"run_id": "20261009T000000Z-aaaaaaaaaaaa", "warnings": []},
+                                 Credentials(VAST_TOKEN, HF_TOKEN))
+                transport = SSHTransport(state, Endpoint("unit.invalid", 2222))
+                clock = Clock()
+                deadline = clock.deadline(20)
+                attempts = []
+
+                def execute(args, deadline, **kwargs):
+                    if args[0] == "scp":
+                        attempts.append(args)
+                        self.assertEqual(kwargs["secrets"], (VAST_TOKEN, HF_TOKEN))
+                        if len(attempts) < 3:
+                            raise JobError("scp: Connection closed")
+                    return b""
+
+                with patch("run_job.run_command", side_effect=execute), patch.object(state, "log") as log:
+                    if operation == "worker":
+                        transport.upload(deadline)
+                    elif operation == "agent":
+                        transport.upload_agent(None, deadline)
+                    else:
+                        transport.fetch("remote.log", root / "remote.log.part", deadline)
+                self.assertEqual(len(attempts), 3)
+                self.assertTrue(all(args == attempts[0] for args in attempts))
+                self.assertEqual(log.call_count, 2)
+                self.assertEqual(clock.value, 3)
+                self.assertIn("StrictHostKeyChecking=accept-new", attempts[0])
+
+    def test_scp_retries_are_bounded_and_permanent_failures_stop_immediately(self):
+        for message, count, error_type in (
+            ("scp: Connection reset by peer", 3, JobError),
+            ("Permission denied (publickey). scp: Connection closed", 1, JobError),
+            ("scp: No such file or directory", 1, JobError),
+            ("Host key verification failed. scp: Connection closed", 1, run_job.HostKeyError),
+        ):
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                state = RunState(root, root, {"run_id": "20261009T000000Z-aaaaaaaaaaaa", "warnings": []},
+                                 Credentials(VAST_TOKEN, HF_TOKEN))
+                transport = SSHTransport(state, Endpoint("unit.invalid", 2222))
+                with patch("run_job.run_command", side_effect=JobError(message)) as command, \
+                     patch.object(state, "log"):
+                    with self.assertRaises(error_type):
+                        transport.fetch("remote.log", root / "remote.log.part", Clock().deadline(20))
+                self.assertEqual(command.call_count, count)
+
+    def test_scp_retry_cannot_extend_deadline_or_replay_remote_stages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = RunState(root, root, {"run_id": "20261009T000000Z-aaaaaaaaaaaa", "warnings": []},
+                             Credentials(VAST_TOKEN, HF_TOKEN))
+            transport = SSHTransport(state, Endpoint("unit.invalid", 2222))
+            clock = Clock()
+            with patch("run_job.run_command", side_effect=JobError("scp: Connection closed")) as command, \
+                 patch.object(state, "log"):
+                with self.assertRaises(run_job.DeadlineExceeded):
+                    transport.fetch("remote.log", root / "remote.log.part", clock.deadline(.5))
+                self.assertEqual(command.call_count, 1)
+            self.assertEqual(clock.value, .5)
+            with patch("run_job.run_command", side_effect=JobError("Connection closed")) as command:
+                with self.assertRaises(JobError):
+                    transport.command("owned-worker-stage", Clock().deadline(20))
+                self.assertEqual(command.call_count, 1)
 
     def test_help_does_not_read_credentials_or_contact_providers(self):
         with patch("run_job.credentials_from_file") as credentials, redirect_stdout(io.StringIO()):

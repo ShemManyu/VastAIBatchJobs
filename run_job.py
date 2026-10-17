@@ -84,6 +84,7 @@ class Settings:
     max_bandwidth_price: float | None = None
     offer_id: int | None = None
     gpu_count: int = 1
+    max_download_price: float | None = None
 
     def validate(self) -> None:
         if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", self.model_repo):
@@ -100,6 +101,10 @@ class Settings:
             self.max_bandwidth_price, "Maximum bandwidth price",
         ) < 0:
             raise JobError("Maximum bandwidth price must be non-negative.")
+        if self.max_download_price is not None and number(
+            self.max_download_price, "Maximum download price",
+        ) < 0:
+            raise JobError("Maximum download price must be non-negative.")
         positive_int(self.disk_gb, "Disk allocation")
         positive_int(self.context_size, "Context size")
         positive_int(self.max_tokens, "Maximum output tokens")
@@ -246,6 +251,12 @@ def select_offer(settings: Settings, offers: list[Offer], *, model_size_bytes: i
             raise JobError(
                 f"No offers meet the USD {settings.max_bandwidth_price:g}/GB bandwidth cap."
             )
+    if settings.max_download_price is not None:
+        offers = [offer for offer in offers if offer.download_cost_per_gb <= settings.max_download_price]
+        if not offers:
+            raise JobError(
+                f"No offers meet the USD {settings.max_download_price:g}/GB download cap."
+            )
     offers = [
         offer for offer in offers
         if offer.gpu_ram_mb * offer.gpu_count * 1_000_000 >= model_size_bytes
@@ -271,6 +282,7 @@ def preview(settings: Settings, model: dict[str, Any], template: Template, offer
             "cleanup_seconds": CLEANUP_SECONDS, "disk_gb": settings.disk_gb,
             "context_size": settings.context_size, "max_tokens": settings.max_tokens,
             "max_bandwidth_price_per_gb_usd": settings.max_bandwidth_price,
+            "max_download_price_per_gb_usd": settings.max_download_price,
             **({"agent": settings.agent.public()} if settings.agent is not None else {}),
         },
         "task_environment_names": sorted(settings.credentials.task),
@@ -430,23 +442,47 @@ class SSHTransport:
     def probe(self, deadline: Deadline) -> None:
         self.command("true", deadline)
 
+    def _copy(self, args: list[str], deadline: Deadline, *, context: str) -> None:
+        for attempt in range(3):
+            deadline.remaining()
+            try:
+                run_command(args, deadline, secrets=self.state.credentials.secrets, context=context)
+                return
+            except (HostKeyError, DeadlineExceeded):
+                raise
+            except JobError as error:
+                message = error_text(error, self.state.credentials.secrets)
+                lowered = message.lower()
+                if "host key verification failed" in lowered or "remote host identification has changed" in lowered:
+                    raise HostKeyError("SSH host key changed or could not be verified; refusing SCP.") from error
+                permanent = any(text in lowered for text in (
+                    "permission denied", "no such file", "not a regular file", "subsystem request failed",
+                ))
+                transient = any(text in lowered for text in (
+                    "connection closed", "connection reset", "connection refused",
+                ))
+                if attempt == 2 or permanent or not transient:
+                    raise
+                self.state.log(f"{context}: {message}; retry {attempt + 1}/2.")
+                deadline.sleep(2 ** attempt)
+
     def upload(self, deadline: Deadline) -> None:
         self.command(f"mkdir -m 700 -p {shlex.quote(self.remote_dir)}", deadline)
-        run_command(
+        self._copy(
             ["scp", "-q", *self.options(deadline), "-P", str(self.endpoint.port),
              str(ROOT / "remote_job.py"), str(ROOT / "job_utils.py"),
              str(ROOT / "requirements.txt"), self.endpoint.scp_path(self.remote_dir + "/")],
-            deadline, secrets=self.state.credentials.secrets, context="Uploading remote worker",
+            deadline, context="Uploading remote worker",
         )
 
     def upload_agent(self, inputs: Path | None, deadline: Deadline) -> None:
         files = [ROOT / name for name in ("agent_job.py", "agent_tools.py", "agent_utils.py")]
         if inputs is not None:
             files.append(inputs)
-        run_command(
+        self._copy(
             ["scp", "-q", *self.options(deadline), "-P", str(self.endpoint.port),
              *(str(path) for path in files), self.endpoint.scp_path(self.remote_dir + "/")],
-            deadline, secrets=self.state.credentials.secrets, context="Uploading agent tools and inputs",
+            deadline, context="Uploading agent tools and inputs",
         )
 
     def invoke(self, stage: str, request: dict[str, Any], deadline: Deadline) -> dict[str, Any]:
@@ -485,10 +521,10 @@ class SSHTransport:
             "agent-transcript.json", "artifacts.tar",
         ):
             raise JobError("Invalid remote artifact name.")
-        run_command(
+        self._copy(
             ["scp", "-q", *self.options(deadline), "-P", str(self.endpoint.port),
              self.endpoint.scp_path(f"{self.remote_dir}/{filename}"), str(destination)],
-            deadline, secrets=self.state.credentials.secrets, context=f"Retrieving {filename}",
+            deadline, context=f"Retrieving {filename}",
         )
 
 
@@ -802,6 +838,7 @@ def run_workflow(
             "disk_gb": settings.disk_gb, "context_size": settings.context_size,
             "max_tokens": settings.max_tokens, "temperature": settings.temperature,
             "max_bandwidth_price_per_gb_usd": settings.max_bandwidth_price,
+            "max_download_price_per_gb_usd": settings.max_download_price,
             "prompt_sha256": hashlib.sha256(settings.prompt.encode()).hexdigest(),
             **({
                 "agent": settings.agent.public(), "task_environment_names": sorted(settings.credentials.task),
@@ -1009,6 +1046,8 @@ def parser_for_cli() -> argparse.ArgumentParser:
         run.add_argument("--max-hourly-price", type=float, default=4.0)
         run.add_argument("--max-bandwidth-price", type=float,
                          help="Optional advertised USD/GB cap for both ingress and egress.")
+        run.add_argument("--max-download-price", type=float,
+                         help="Optional additional advertised USD/GB cap for model/prerequisite ingress.")
         run.add_argument("--timeout-minutes", type=float, default=180)
         run.add_argument("--gpu-policy", choices=("prefer-a100", "a100-only"), default="prefer-a100")
         run.add_argument("--gpu-count", type=int, default=1, help="Exact number of GPUs in one rented instance.")
@@ -1096,6 +1135,7 @@ def main(argv: list[str] | None = None) -> int:
             args.max_bandwidth_price,
             args.offer_id,
             args.gpu_count,
+            args.max_download_price,
         )
         settings.validate()
         if args.dry_run:
