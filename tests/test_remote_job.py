@@ -306,6 +306,14 @@ class WorkerTests(WorkerFixture):
         self.assertIn("--offline", args)
         self.assertEqual(args[args.index("--verbosity") + 1], "4")
 
+    def test_server_thinking_cap_is_explicit_and_default_is_unchanged(self):
+        arguments = (Path("/server"), Path("/model.gguf"), 4096, 1234)
+        self.assertNotIn("--reasoning-budget", server_args(*arguments))
+        for budget in (0, 512):
+            with self.subTest(budget=budget):
+                args = server_args(*arguments, reasoning_budget=budget)
+                self.assertEqual(args[args.index("--reasoning-budget") + 1], str(budget))
+
     def test_server_readiness_waits_for_loading_but_rejects_failed_or_missing_health(self):
         process = MagicMock()
         process.poll.return_value = None
@@ -461,11 +469,12 @@ class LocalHttpInferenceTests(WorkerFixture):
             thread.join(timeout=5)
         process.poll.return_value = 0
 
-    def execute_inference(self, context_size=4096):
+    def execute_inference(self, context_size=4096, reasoning_budget=None):
         request = {
             "hf_token": HF_TOKEN, "model": self.model, "gpu_name": "A100 SXM4",
             "prompt": "Literal 'quotes'; $(not-a-command)\nnext caf\u00e9",
             "context_size": context_size, "max_tokens": 1024, "temperature": 0.7,
+            "reasoning_budget": reasoning_budget,
         }
         with patch("remote_job.gpu_details",
                    return_value={"gpu_name": "NVIDIA A100-SXM4-40GB", "gpu_vram_mib": 40536}), \
@@ -505,6 +514,22 @@ class LocalHttpInferenceTests(WorkerFixture):
         self.assertEqual(self.context_checks, ["/props"])
         self.assertEqual(self.requests, [])
         self.assertFalse((self.root / "response.txt").exists())
+
+    def test_worker_applies_thinking_budget_to_actual_server_launch(self):
+        self.execute_inference(reasoning_budget=256)
+        args = self.spawn_arguments
+        self.assertEqual(args[args.index("--reasoning-budget") + 1], "256")
+
+    def test_worker_rejects_invalid_thinking_cap_before_gpu_or_download(self):
+        for budget in (True, -1, 1024, "256"):
+            with self.subTest(budget=budget), patch("remote_job.gpu_details") as gpu:
+                with self.assertRaisesRegex(JobError, "Reasoning budget"):
+                    infer(self.root, {
+                        "hf_token": HF_TOKEN, "prompt": "task", "gpu_name": "A100",
+                        "context_size": 4096, "max_tokens": 1024, "temperature": 0,
+                        "reasoning_budget": budget,
+                    }, Clock().deadline(30))
+                gpu.assert_not_called()
 
     def test_actual_larger_context_is_verified_before_generation(self):
         self.properties["default_generation_settings"]["n_ctx"] = 65536

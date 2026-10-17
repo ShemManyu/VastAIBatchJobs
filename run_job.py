@@ -27,7 +27,7 @@ from agent_utils import (
 from job_utils import (
     Deadline, DeadlineExceeded, JobError, LLAMA_COMMIT, LLAMA_RELEASE, MAX_WORKER_REQUEST_BYTES, atomic_write,
     commit_sha, completion_text, error_text, model_filenames, number, object_value,
-    positive_int, read_json, redact, run_command, sha256_file, write_json,
+    positive_int, read_json, reasoning_token_budget, redact, run_command, sha256_file, write_json,
 )
 from vast_client import (
     ApiError, DEFAULT_TEMPLATE_HASH, Offer, Template, VastClient, choose_offer,
@@ -85,6 +85,7 @@ class Settings:
     offer_id: int | None = None
     gpu_count: int = 1
     max_download_price: float | None = None
+    reasoning_budget: int | None = None
 
     def validate(self) -> None:
         if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", self.model_repo):
@@ -108,6 +109,7 @@ class Settings:
         positive_int(self.disk_gb, "Disk allocation")
         positive_int(self.context_size, "Context size")
         positive_int(self.max_tokens, "Maximum output tokens")
+        reasoning_token_budget(self.reasoning_budget, self.max_tokens)
         temperature = number(self.temperature, "Temperature")
         if self.max_tokens >= self.context_size or not 0 <= temperature <= 2:
             raise JobError("Output tokens must be below context size; temperature must be between 0 and 2.")
@@ -281,6 +283,7 @@ def preview(settings: Settings, model: dict[str, Any], template: Template, offer
             "timeout_minutes": settings.timeout_minutes,
             "cleanup_seconds": CLEANUP_SECONDS, "disk_gb": settings.disk_gb,
             "context_size": settings.context_size, "max_tokens": settings.max_tokens,
+            "reasoning_budget": settings.reasoning_budget,
             "max_bandwidth_price_per_gb_usd": settings.max_bandwidth_price,
             "max_download_price_per_gb_usd": settings.max_download_price,
             **({"agent": settings.agent.public()} if settings.agent is not None else {}),
@@ -837,6 +840,7 @@ def run_workflow(
             "timeout_minutes": settings.timeout_minutes, "gpu_policy": settings.gpu_policy,
             "disk_gb": settings.disk_gb, "context_size": settings.context_size,
             "max_tokens": settings.max_tokens, "temperature": settings.temperature,
+            "reasoning_budget": settings.reasoning_budget,
             "max_bandwidth_price_per_gb_usd": settings.max_bandwidth_price,
             "max_download_price_per_gb_usd": settings.max_download_price,
             "prompt_sha256": hashlib.sha256(settings.prompt.encode()).hexdigest(),
@@ -910,6 +914,7 @@ def run_workflow(
             "gpu_count": settings.gpu_count,
             "context_size": settings.context_size, "max_tokens": settings.max_tokens,
             "temperature": settings.temperature,
+            "reasoning_budget": settings.reasoning_budget,
         }
         if settings.agent is not None:
             request.update({
@@ -1055,6 +1060,8 @@ def parser_for_cli() -> argparse.ArgumentParser:
         run.add_argument("--context-size", type=int, default=4096 if name == "run" else 16384)
         run.add_argument("--max-tokens", type=int, default=1024 if name == "run" else 2048)
         run.add_argument("--temperature", type=float, default=0.7 if name == "run" else 0)
+        run.add_argument("--reasoning-budget", type=int,
+                         help="Optional thinking-token cap below --max-tokens; 0 ends thinking immediately.")
         run.add_argument("--dry-run", action="store_true", help="Only validate and query metadata/offers.")
         if name == "agent":
             run.add_argument("--input-dir", type=Path, help="Optional small, credential-free workspace snapshot.")
@@ -1136,6 +1143,7 @@ def main(argv: list[str] | None = None) -> int:
             args.offer_id,
             args.gpu_count,
             args.max_download_price,
+            args.reasoning_budget,
         )
         settings.validate()
         if args.dry_run:

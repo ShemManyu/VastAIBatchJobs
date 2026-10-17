@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any, Iterator
 from job_utils import (
     ContextLimitError, Deadline, DeadlineExceeded, JobError, LLAMA_COMMIT, MAX_WORKER_REQUEST_BYTES, atomic_write,
     commit_sha, completion_text, error_text, model_filenames, number,
-    object_value, positive_int, redact, run_command, sha256_file,
+    object_value, positive_int, reasoning_token_budget, redact, run_command, sha256_file,
     stop_process, write_json,
 )
 
@@ -310,6 +310,7 @@ def verify_server_context(http: requests.Session, url: str, requested: int, dead
 
 def server_args(
     binary: Path, model: Path, context_size: int, port: int, api_key_file: Path | None = None,
+    reasoning_budget: int | None = None,
 ) -> list[str]:
     # The pinned runtime maps loader INFO messages to trace verbosity.
     args = [
@@ -320,6 +321,8 @@ def server_args(
     ]
     if api_key_file is not None:
         args.extend(["--api-key-file", str(api_key_file), "--no-agent", "--no-webui"])
+    if reasoning_budget is not None:
+        args.extend(["--reasoning-budget", str(reasoning_budget)])
     return args
 
 
@@ -414,7 +417,8 @@ class ModelRuntime:
                 raise ContextLimitError(len(tokens), self.max_tokens, self.context_size)
             payload["response_format"] = {"type": "json_object", "schema": schema}
         completion = self.post("/v1/chat/completions", payload, deadline)
-        completion_text(completion)
+        if schema is None:
+            completion_text(completion)
         return completion
 
 
@@ -435,6 +439,7 @@ def model_runtime(
         raise JobError("Expected GPU name is missing.")
     context_size = positive_int(request.get("context_size"), "Context size")
     max_tokens = positive_int(request.get("max_tokens"), "Output token limit")
+    reasoning_budget = reasoning_token_budget(request.get("reasoning_budget"), max_tokens)
     temperature = number(request.get("temperature"), "Temperature")
     if max_tokens >= context_size or not 0 <= temperature <= 2:
         raise JobError("Output limit must be below context size; temperature must be between 0 and 2.")
@@ -468,7 +473,7 @@ def model_runtime(
             process = None
             try:
                 process = subprocess.Popen(
-                    server_args(binary, model, context_size, port, api_key_file),
+                    server_args(binary, model, context_size, port, api_key_file, reasoning_budget),
                     stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
                     env=environment, start_new_session=True,
                 )

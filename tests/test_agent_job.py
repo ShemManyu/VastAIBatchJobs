@@ -235,6 +235,30 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(self.sandbox.actions, [])
         self.assertFalse((self.root / "response.txt").exists())
 
+    def test_reasoning_only_completion_is_preserved_redacted_and_never_executed(self):
+        completion = {
+            "choices": [{"message": {"role": "assistant", "content": "",
+                                     "reasoning_content": "still thinking " + TASK_KEY},
+                         "finish_reason": "length"}],
+            "usage": {"completion_tokens": 2048},
+        }
+        self.responses = [completion]
+        report = run_agent(
+            self.root, "Do the task.", self.options, self.sandbox,
+            self.runtime.complete, Deadline(60), self.runtime.gpu, (TASK_KEY,),
+        )
+        self.assertEqual(report["status"], "failed")
+        self.assertIn("no non-empty assistant text", report["error"])
+        self.assertEqual(self.sandbox.actions, [])
+        raw = (self.root / "agent-transcript.json").read_text()
+        self.assertNotIn(TASK_KEY, raw)
+        saved = json.loads(raw)["steps"][0]
+        self.assertEqual(saved["completion"]["choices"][0]["finish_reason"], "length")
+        self.assertEqual(saved["completion"]["usage"]["completion_tokens"], 2048)
+        self.assertIn("still thinking", saved["completion"]["choices"][0]["message"]["reasoning_content"])
+        self.assertNotIn("action", saved)
+        self.assertFalse((self.root / "response.txt").exists())
+
     def test_unfit_latest_observation_fails_without_dropping_it_or_reexecuting_tools(self):
         self.runtime.context_size = 2000
         self.runtime.max_tokens = 128

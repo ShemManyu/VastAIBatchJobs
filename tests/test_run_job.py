@@ -107,6 +107,25 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual([payload["gpu_count"] for _, payload in self.transports[-1].requests], [8, 8])
         self.assertFalse(client.exists)
 
+    def test_reasoning_budget_is_persisted_previewed_and_forwarded(self):
+        for budget in (None, 0, 512):
+            with self.subTest(budget=budget):
+                settings = replace(self.settings, reasoning_budget=budget)
+                state = self.execute(settings=settings)
+                self.assertEqual(state.data["settings"]["reasoning_budget"], budget)
+                request = self.transports[-1].requests[-1][1]
+                self.assertEqual(request["reasoning_budget"], budget)
+                preview = run_job.preview(
+                    settings, MODEL, SimpleNamespace(hash_id="template", image="cuda"), FakeClient().offer,
+                )
+                self.assertEqual(preview["limits"]["reasoning_budget"], budget)
+        for budget in (True, -1, 1024, 1.5):
+            with self.subTest(invalid=budget):
+                client = FakeClient()
+                with self.assertRaises(JobError):
+                    self.execute(client, settings=replace(self.settings, reasoning_budget=budget))
+                self.assertEqual(client.created, 0)
+
     def test_unconfirmed_or_inconsistent_multi_gpu_inventory_fails_with_cleanup(self):
         original = FakeTransport.invoke
         for malformed in (

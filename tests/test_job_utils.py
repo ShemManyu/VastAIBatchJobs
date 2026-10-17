@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from job_utils import (
     Deadline, DeadlineExceeded, JobError, atomic_write, completion_text,
-    model_filename, model_filenames, number, redact, run_command, write_json,
+    model_filename, model_filenames, number, reasoning_token_budget, redact, run_command, write_json,
 )
 from tests.fakes import ANSWER, Clock, HF_TOKEN, VAST_TOKEN
 
@@ -40,6 +40,13 @@ class UtilityTests(unittest.TestCase):
                 model_filename(name)
         self.assertEqual(model_filename("subdir/8B-Q4_K_M.gguf"), "subdir/8B-Q4_K_M.gguf")
         self.assertEqual(model_filename("floral-8b.gguf"), "floral-8b.gguf")
+
+    def test_reasoning_budget_reserves_output_and_rejects_invalid_types(self):
+        for value in (None, 0, 1, 1023):
+            self.assertEqual(reasoning_token_budget(value, 1024), value)
+        for value in (True, False, -1, 1024, 1025, 1.0, "512"):
+            with self.subTest(value=value), self.assertRaises(JobError):
+                reasoning_token_budget(value, 1024)
 
     def test_split_model_names_are_a_complete_ordered_safe_set(self):
         self.assertEqual(model_filenames("quant/model-00001-of-00003.gguf"), [

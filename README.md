@@ -120,6 +120,7 @@ Available actions are `run` with an argv array, `read_file`, `read_history`, `wr
 | `--max-artifact-mb` | `64` | Returned workspace byte limit, in MiB; maximum 1024 |
 | `--context-size` | `16384` | Agent history and reserved output tokens |
 | `--max-tokens` | `2048` | Tokens per model decision |
+| `--reasoning-budget` | Unset | Optional thinking-token cap, from 0 to `max-tokens - 1`; reserves remaining output capacity for an action |
 | `--temperature` | `0` | Agent generation temperature |
 
 Other instance/model/output defaults match `run`. Input snapshots are limited to 64 MiB and 5,000 files. Symlinks, hardlinks, special files, common credential paths, and dependency directories are refused. Known credential values are checked before upload; this cannot detect every possible secret, so review selected input files yourself. Relative `--input-dir` paths resolve against the caller's current directory.
@@ -165,7 +166,7 @@ modeloutput/<run-id>/
   remote.log
 ```
 
-`response.txt` is the summary from the final JSON decision, not an OpenAI completion envelope. The report records outcome, limits, decisions, and the workspace manifest/checksums. The transcript preserves decisions, model completions, and actual tool observations; it can contain private task/file content. There is no `completion.json` for agent mode. Dependencies/caches named `node_modules`, `.git`, `.venv`, `venv`, `__pycache__`, `.cache`, or `.npm` are intentionally excluded and listed in the manifest. Keep the returned package manifest/lockfile to reinstall dependencies.
+`response.txt` is the summary from the final JSON decision, not an OpenAI completion envelope. The report records outcome, limits, decisions, and the workspace manifest/checksums. The transcript preserves decisions, model completions, and actual tool observations; it can contain private task/file content. Rejected agent completions, including empty text with reasoning and token-limit metadata, are also preserved with known credentials redacted and never executed. There is no `completion.json` for agent mode. Dependencies/caches named `node_modules`, `.git`, `.venv`, `venv`, `__pycache__`, `.cache`, or `.npm` are intentionally excluded and listed in the manifest. Keep the returned package manifest/lockfile to reinstall dependencies.
 
 Credential-bearing files or unsafe/oversized archives are refused rather than silently copied. Generated script bytes are not rewritten. Tool failures are returned to the model for correction, with a recovery hint after three consecutive failures; five consecutive failures stop the run explicitly. Five identical finish rejections also stop the run even if successful file edits or other actions intervene. A changed finish diagnostic resets that separate counter, allowing genuine verification progress. Malformed or token-limited decisions never execute; unrecoverable context overflow and exhausted step/job budgets fail explicitly. Failed runs preserve available partial scripts, outputs, and transcripts before teardown. Finishing alone is not evidence that every task claim is correct: inspect the execution transcript and source references.
 
@@ -187,9 +188,12 @@ Credential-bearing files or unsafe/oversized archives are refused rather than si
 | `--disk-gb` | `64` | Instance disk allocation |
 | `--context-size` | `4096` | Total model context, including input and output |
 | `--max-tokens` | `1024` | Output token limit, strictly below context size |
+| `--reasoning-budget` | Unset | Optional thinking-token cap below the output limit; 0 ends thinking immediately |
 | `--temperature` | `0.7` | Generation temperature between 0 and 2 |
 | `--output-dir` | `<repository>/modeloutput` | Local output root |
 | `--env-file` | `<repository>/.env` | Credential file |
+
+For thinking-enabled models, reasoning consumes the same output allowance as the final text or JSON action. For example, `--max-tokens 16384 --reasoning-budget 2048` asks the pinned llama-server runtime to end thinking after 2048 tokens, leaving capacity for the response. This uses the model template's thinking boundaries, not a separate inference retry; it does not guarantee correctness or a completed action. Unset preserves the runtime's default, unrestricted thinking behavior. The configured cap is recorded in the dry-run preview and run metadata.
 
 The default template is pinned to `pytorch/pytorch:2.4.0-cuda12.4-cudnn9-devel`. A changed default image is rejected rather than silently trusted. Overrides may also use official `nvidia/cuda` development tags such as `12.4.1-devel-ubuntu22.04`. They must provide Python 3.10+, CUDA development tools, build tools, and noninteractive root SSH access. On root Debian/Ubuntu images with `apt-get`, bootstrap can install missing Python, Python venv support, and build tools before invoking the worker. The worker queries every GPU's compute capability and passes explicit numeric CUDA architectures to CMake, avoiding the unsupported `native` value on Ubuntu 22.04's CMake 3.22. Python versions below 3.10, missing CUDA toolkits, and incomplete/malformed capability inventories still fail explicitly. CUDA-only images avoid downloading an unused PyTorch environment, but startup time depends on the host and image cache.
 

@@ -155,6 +155,14 @@ def commit_sha(value: object) -> str:
     return value
 
 
+def reasoning_token_budget(value: object, max_tokens: int) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value < max_tokens:
+        raise JobError("Reasoning budget must be a non-negative integer below the output token limit.")
+    return value
+
+
 def completion_text(value: object) -> str:
     completion = object_value(value, "Completion")
     choices = completion.get("choices")
