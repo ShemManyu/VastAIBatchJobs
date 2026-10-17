@@ -46,6 +46,10 @@ def gpu_details(expected: str, deadline: Deadline, expected_count: int = 1) -> d
         value = re.sub(r"^q(?=\s+rtx)", "", value, flags=re.IGNORECASE)
         value = re.sub(r"\b(nvidia|geforce|tesla|quadro)\b", "", value, flags=re.IGNORECASE)
         value = re.sub(r"[-_ ]\d+gb(?:\b|_)", "", value, flags=re.IGNORECASE)
+        value = re.sub(
+            r"\b(rtx[\s_-]+pro[\s_-]+6000)[\s_-]+blackwell\b", r"\1",
+            value, flags=re.IGNORECASE,
+        )
         return re.sub(r"[^a-z0-9]", "", value.lower())
 
     devices = []
