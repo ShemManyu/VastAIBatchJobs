@@ -84,6 +84,7 @@ class Settings:
     max_bandwidth_price: float | None = None
     offer_id: int | None = None
     gpu_count: int = 1
+    max_download_price: float | None = None
 
     def validate(self) -> None:
         if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", self.model_repo):
@@ -100,6 +101,10 @@ class Settings:
             self.max_bandwidth_price, "Maximum bandwidth price",
         ) < 0:
             raise JobError("Maximum bandwidth price must be non-negative.")
+        if self.max_download_price is not None and number(
+            self.max_download_price, "Maximum download price",
+        ) < 0:
+            raise JobError("Maximum download price must be non-negative.")
         positive_int(self.disk_gb, "Disk allocation")
         positive_int(self.context_size, "Context size")
         positive_int(self.max_tokens, "Maximum output tokens")
@@ -246,6 +251,12 @@ def select_offer(settings: Settings, offers: list[Offer], *, model_size_bytes: i
             raise JobError(
                 f"No offers meet the USD {settings.max_bandwidth_price:g}/GB bandwidth cap."
             )
+    if settings.max_download_price is not None:
+        offers = [offer for offer in offers if offer.download_cost_per_gb <= settings.max_download_price]
+        if not offers:
+            raise JobError(
+                f"No offers meet the USD {settings.max_download_price:g}/GB download cap."
+            )
     offers = [
         offer for offer in offers
         if offer.gpu_ram_mb * offer.gpu_count * 1_000_000 >= model_size_bytes
@@ -271,6 +282,7 @@ def preview(settings: Settings, model: dict[str, Any], template: Template, offer
             "cleanup_seconds": CLEANUP_SECONDS, "disk_gb": settings.disk_gb,
             "context_size": settings.context_size, "max_tokens": settings.max_tokens,
             "max_bandwidth_price_per_gb_usd": settings.max_bandwidth_price,
+            "max_download_price_per_gb_usd": settings.max_download_price,
             **({"agent": settings.agent.public()} if settings.agent is not None else {}),
         },
         "task_environment_names": sorted(settings.credentials.task),
@@ -802,6 +814,7 @@ def run_workflow(
             "disk_gb": settings.disk_gb, "context_size": settings.context_size,
             "max_tokens": settings.max_tokens, "temperature": settings.temperature,
             "max_bandwidth_price_per_gb_usd": settings.max_bandwidth_price,
+            "max_download_price_per_gb_usd": settings.max_download_price,
             "prompt_sha256": hashlib.sha256(settings.prompt.encode()).hexdigest(),
             **({
                 "agent": settings.agent.public(), "task_environment_names": sorted(settings.credentials.task),
@@ -1009,6 +1022,8 @@ def parser_for_cli() -> argparse.ArgumentParser:
         run.add_argument("--max-hourly-price", type=float, default=4.0)
         run.add_argument("--max-bandwidth-price", type=float,
                          help="Optional advertised USD/GB cap for both ingress and egress.")
+        run.add_argument("--max-download-price", type=float,
+                         help="Optional additional advertised USD/GB cap for model/prerequisite ingress.")
         run.add_argument("--timeout-minutes", type=float, default=180)
         run.add_argument("--gpu-policy", choices=("prefer-a100", "a100-only"), default="prefer-a100")
         run.add_argument("--gpu-count", type=int, default=1, help="Exact number of GPUs in one rented instance.")
@@ -1096,6 +1111,7 @@ def main(argv: list[str] | None = None) -> int:
             args.max_bandwidth_price,
             args.offer_id,
             args.gpu_count,
+            args.max_download_price,
         )
         settings.validate()
         if args.dry_run:

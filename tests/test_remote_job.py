@@ -181,6 +181,23 @@ class WorkerTests(WorkerFixture):
                 with self.assertRaises(JobError):
                     gpu_details("RTX PRO 6000 Max-Q", Deadline(10), 4)
 
+    def test_blackwell_workstation_offer_alias_preserves_variant_checks(self):
+        output = b"NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 97887\n" * 4
+        with patch("remote_job.run_command", return_value=output):
+            gpu = gpu_details("RTX PRO 6000 WS", Deadline(10), 4)
+            self.assertEqual(gpu["gpu_count"], 4)
+            self.assertEqual(gpu["gpu_vram_total_mib"], 391548)
+        for name in (
+            "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+            "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+            "NVIDIA RTX PRO 5000 Blackwell Workstation Edition",
+            "NVIDIA RTX PRO 6000 Ada Workstation Edition",
+        ):
+            wrong = output.replace(output.split(b",")[0], name.encode(), 1)
+            with self.subTest(name=name), patch("remote_job.run_command", return_value=wrong):
+                with self.assertRaises(JobError):
+                    gpu_details("RTX PRO 6000 WS", Deadline(10), 4)
+
     def test_every_allocated_gpu_is_verified_with_per_device_and_total_memory(self):
         output = b"NVIDIA A100-SXM4-40GB, 40536\n" * 8
         with patch("remote_job.run_command", return_value=output):

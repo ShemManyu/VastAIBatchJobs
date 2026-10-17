@@ -302,6 +302,45 @@ class WorkflowTests(unittest.TestCase):
                         self.execute(client, settings=settings)
                 self.assertEqual(client.created, 0)
 
+    def test_download_cap_boundary_combines_with_bidirectional_cap(self):
+        client = FakeClient()
+        valid = replace(client.offer, download_cost_per_gb=.00261, upload_cost_per_gb=.00521)
+        settings = replace(self.settings, max_download_price=.00261, max_bandwidth_price=.00521)
+        self.assertEqual(run_job.select_offer(settings, [valid]), valid)
+        with patch.object(client, "offers", return_value=[valid]):
+            state = self.execute(client, settings=settings)
+        self.assertEqual(state.data["settings"]["max_download_price_per_gb_usd"], .00261)
+        for offer in (
+            replace(valid, download_cost_per_gb=.002610001),
+            replace(valid, upload_cost_per_gb=.005210001),
+        ):
+            with self.subTest(offer=offer), self.assertRaises(JobError):
+                run_job.select_offer(settings, [offer])
+        free = replace(valid, download_cost_per_gb=0)
+        self.assertEqual(run_job.select_offer(replace(settings, max_download_price=0), [free]), free)
+        self.assertEqual(run_job.select_offer(self.settings, [valid]), valid)
+
+    def test_download_cap_is_revalidated_before_creation(self):
+        for download_price in (.002610001, .00521):
+            with self.subTest(download_price=download_price):
+                client = FakeClient()
+                valid = replace(client.offer, download_cost_per_gb=.00261, upload_cost_per_gb=.00521)
+                increased = replace(valid, download_cost_per_gb=download_price)
+                settings = replace(self.settings, max_download_price=.00261, max_bandwidth_price=.00521)
+                with patch.object(client, "offers", side_effect=[[valid], [increased]]) as search:
+                    with self.assertRaises(JobError):
+                        self.execute(client, settings=settings)
+                self.assertEqual(search.call_count, 2)
+                self.assertEqual(client.created, 0)
+
+    def test_invalid_download_prices_never_rent(self):
+        for value in (-.001, float("nan"), float("inf"), True):
+            with self.subTest(value=value):
+                client = FakeClient()
+                with self.assertRaises(JobError):
+                    self.execute(client, settings=replace(self.settings, max_download_price=value))
+                self.assertEqual(client.created, 0)
+
     def test_hugging_face_access_denial_happens_before_rental(self):
         client = FakeClient()
         with patch("run_job.shutil.which", return_value="/fixture/tool"), \
@@ -456,7 +495,8 @@ class WorkflowTests(unittest.TestCase):
 
     def test_cli_offer_override_controls_the_actual_dry_run_selection(self):
         client = FakeClient()
-        requested = replace(client.offer, id=20, hourly_price=2)
+        requested = replace(client.offer, id=20, hourly_price=2,
+                            download_cost_per_gb=.00261, upload_cost_per_gb=.00521)
         stdout = io.StringIO()
         env = self.base / ".env"
         env.write_text(f"VAST_AI_API_KEY={VAST_TOKEN}\nHUGGING_FACE_ACCESS_TOKEN={HF_TOKEN}\n")
@@ -465,11 +505,13 @@ class WorkflowTests(unittest.TestCase):
              patch.object(client, "offers", return_value=[client.offer, requested]) as search, \
              patch("run_job.inspect_model", return_value=dict(MODEL)), redirect_stdout(stdout):
             result = main(["run", "--model-repo", "unit/model", "--model-file", "model-Q4_K_M.gguf",
-                           "--prompt", "test", "--offer-id", "20", "--dry-run"])
+                           "--prompt", "test", "--offer-id", "20", "--max-download-price", ".00261",
+                           "--max-bandwidth-price", ".00521", "--dry-run"])
         self.assertEqual(result, 0)
         preview = json.loads(stdout.getvalue())
         self.assertEqual(preview["selected_offer"]["offer_id"], 20)
         self.assertEqual(preview["limits"]["requested_offer_id"], 20)
+        self.assertEqual(preview["limits"]["max_download_price_per_gb_usd"], .00261)
         self.assertEqual(search.call_args.kwargs["offer_id"], 20)
         self.assertEqual(client.created, 0)
         self.assertFalse((self.base / ".vastai-runs").exists())
